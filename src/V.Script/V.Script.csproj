@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>V.Script</RootNamespace>
+    <AssemblyName>V.Script</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="V.Script.Tests" />
+    <InternalsVisibleTo Include="V.Script.Benchmarks" />
+  </ItemGroup>
+</Project>

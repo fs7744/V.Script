@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/V.Script/V.Script.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/V.Script.Tests/V.Script.Tests.csproj" />
+  </Folder>
+  <Folder Name="/bench/">
+    <Project Path="bench/V.Script.Benchmarks/V.Script.Benchmarks.csproj" />
+  </Folder>
+</Solution>

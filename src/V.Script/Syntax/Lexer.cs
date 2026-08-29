@@ -1,0 +1,544 @@
+using System.Buffers;
+using System.Collections.Frozen;
+using System.Globalization;
+using System.Text;
+using V.Script.Diagnostics;
+
+namespace V.Script.Syntax;
+
+/// <summary>
+/// Converts script source into a token stream. Scans over the source span without
+/// allocating per character; only literal text and identifiers materialize strings.
+/// </summary>
+public sealed class Lexer
+{
+    private static readonly FrozenDictionary<string, SyntaxKind> Keywords =
+        new Dictionary<string, SyntaxKind>(StringComparer.Ordinal)
+        {
+            ["true"] = SyntaxKind.TrueKeyword,
+            ["false"] = SyntaxKind.FalseKeyword,
+            ["null"] = SyntaxKind.NullKeyword,
+            ["var"] = SyntaxKind.VarKeyword,
+            ["if"] = SyntaxKind.IfKeyword,
+            ["else"] = SyntaxKind.ElseKeyword,
+            ["while"] = SyntaxKind.WhileKeyword,
+            ["do"] = SyntaxKind.DoKeyword,
+            ["for"] = SyntaxKind.ForKeyword,
+            ["foreach"] = SyntaxKind.ForeachKeyword,
+            ["in"] = SyntaxKind.InKeyword,
+            ["return"] = SyntaxKind.ReturnKeyword,
+            ["break"] = SyntaxKind.BreakKeyword,
+            ["continue"] = SyntaxKind.ContinueKeyword,
+            ["try"] = SyntaxKind.TryKeyword,
+            ["catch"] = SyntaxKind.CatchKeyword,
+            ["finally"] = SyntaxKind.FinallyKeyword,
+            ["throw"] = SyntaxKind.ThrowKeyword,
+            ["new"] = SyntaxKind.NewKeyword,
+            ["await"] = SyntaxKind.AwaitKeyword,
+            ["is"] = SyntaxKind.IsKeyword,
+            ["as"] = SyntaxKind.AsKeyword,
+            ["typeof"] = SyntaxKind.TypeofKeyword,
+        }.ToFrozenDictionary(StringComparer.Ordinal);
+
+    private static readonly SearchValues<char> DigitChars =
+        SearchValues.Create("0123456789");
+
+    private readonly string _text;
+    private readonly DiagnosticBag _diagnostics;
+    private int _pos;
+    private int _line = 1;
+    private int _lineStart;
+
+    public Lexer(string text, DiagnosticBag diagnostics)
+    {
+        _text = text ?? throw new ArgumentNullException(nameof(text));
+        _diagnostics = diagnostics;
+    }
+
+    private char Current => _pos < _text.Length ? _text[_pos] : '\0';
+
+    private char Peek(int offset = 1) =>
+        _pos + offset < _text.Length ? _text[_pos + offset] : '\0';
+
+    private SourcePosition Here => new(_line, _pos - _lineStart + 1);
+
+    public List<Token> Tokenize()
+    {
+        var tokens = new List<Token>();
+        while (true)
+        {
+            var token = Next();
+            tokens.Add(token);
+            if (token.Kind == SyntaxKind.EndOfFile)
+                return tokens;
+        }
+    }
+
+    private Token Next()
+    {
+        SkipTrivia();
+
+        var start = Here;
+        if (_pos >= _text.Length)
+            return new Token(SyntaxKind.EndOfFile, string.Empty, start);
+
+        var c = Current;
+
+        if (char.IsLetter(c) || c == '_' || c == '@')
+            return ReadIdentifierOrKeyword(start);
+
+        if (char.IsAsciiDigit(c) || (c == '.' && char.IsAsciiDigit(Peek())))
+            return ReadNumber(start);
+
+        return c switch
+        {
+            '"' => ReadString(start),
+            '\'' => ReadChar(start),
+            _ => ReadPunctuation(start),
+        };
+    }
+
+    private void SkipTrivia()
+    {
+        while (_pos < _text.Length)
+        {
+            var c = Current;
+            if (c == '\n')
+            {
+                _pos++;
+                _line++;
+                _lineStart = _pos;
+            }
+            else if (char.IsWhiteSpace(c))
+            {
+                _pos++;
+            }
+            else if (c == '/' && Peek() == '/')
+            {
+                while (_pos < _text.Length && Current != '\n') _pos++;
+            }
+            else if (c == '/' && Peek() == '*')
+            {
+                var start = Here;
+                _pos += 2;
+                while (true)
+                {
+                    if (_pos >= _text.Length)
+                    {
+                        _diagnostics.Report(ErrorCode.UnterminatedComment, start, "块注释未闭合，缺少 '*/'。");
+                        return;
+                    }
+                    if (Current == '*' && Peek() == '/') { _pos += 2; break; }
+                    if (Current == '\n') { _line++; _lineStart = _pos + 1; }
+                    _pos++;
+                }
+            }
+            else
+            {
+                return;
+            }
+        }
+    }
+
+    private Token ReadIdentifierOrKeyword(SourcePosition start)
+    {
+        var verbatim = Current == '@';
+        if (verbatim) _pos++;
+
+        var begin = _pos;
+        while (_pos < _text.Length && (char.IsLetterOrDigit(Current) || Current == '_'))
+            _pos++;
+
+        var text = _text[begin.._pos];
+        if (text.Length == 0)
+        {
+            _diagnostics.Report(ErrorCode.ExpectedIdentifier, start, "'@' 之后需要标识符。");
+            return new Token(SyntaxKind.BadToken, "@", start);
+        }
+
+        if (!verbatim && Keywords.TryGetValue(text, out var keyword))
+        {
+            object? value = keyword switch
+            {
+                SyntaxKind.TrueKeyword => true,
+                SyntaxKind.FalseKeyword => false,
+                _ => null,
+            };
+            return new Token(keyword, text, start, value);
+        }
+
+        return new Token(SyntaxKind.Identifier, text, start);
+    }
+
+    private Token ReadNumber(SourcePosition start)
+    {
+        var begin = _pos;
+
+        if (Current == '0' && (Peek() is 'x' or 'X'))
+            return ReadHex(start);
+        if (Current == '0' && (Peek() is 'b' or 'B'))
+            return ReadBinary(start);
+
+        ScanDigits();
+
+        var isReal = false;
+        if (Current == '.' && char.IsAsciiDigit(Peek()))
+        {
+            isReal = true;
+            _pos++;
+            ScanDigits();
+        }
+
+        if (Current is 'e' or 'E')
+        {
+            var save = _pos;
+            _pos++;
+            if (Current is '+' or '-') _pos++;
+            if (char.IsAsciiDigit(Current)) { isReal = true; ScanDigits(); }
+            else _pos = save;
+        }
+
+        var digits = _text[begin.._pos];
+        var suffix = ReadNumericSuffix();
+        var raw = _text[begin.._pos];
+
+        return DecodeNumber(digits, suffix, isReal, raw, start);
+    }
+
+    private void ScanDigits()
+    {
+        while (_pos < _text.Length &&
+               (DigitChars.Contains(Current) || (Current == '_' && DigitChars.Contains(Peek()))))
+            _pos++;
+    }
+
+    private string ReadNumericSuffix()
+    {
+        var begin = _pos;
+        while (_pos < _text.Length && "uUlLfFdDmM".Contains(Current))
+            _pos++;
+        return _text[begin.._pos];
+    }
+
+    private Token DecodeNumber(string digits, string suffix, bool isReal, string raw, SourcePosition start)
+    {
+        digits = digits.Replace("_", string.Empty);
+        var s = suffix.ToUpperInvariant();
+
+        try
+        {
+            switch (s)
+            {
+                case "M":
+                    return new Token(SyntaxKind.DecimalLiteral, raw, start,
+                        decimal.Parse(digits, CultureInfo.InvariantCulture));
+                case "F":
+                    return new Token(SyntaxKind.FloatLiteral, raw, start,
+                        float.Parse(digits, CultureInfo.InvariantCulture));
+                case "D":
+                    return new Token(SyntaxKind.DoubleLiteral, raw, start,
+                        double.Parse(digits, CultureInfo.InvariantCulture));
+                case "U":
+                    return MakeUnsigned(digits, raw, start, forceLong: false);
+                case "L":
+                    return new Token(SyntaxKind.LongLiteral, raw, start,
+                        long.Parse(digits, CultureInfo.InvariantCulture));
+                case "UL":
+                case "LU":
+                    return new Token(SyntaxKind.ULongLiteral, raw, start,
+                        ulong.Parse(digits, CultureInfo.InvariantCulture));
+                case "":
+                    if (isReal)
+                        return new Token(SyntaxKind.DoubleLiteral, raw, start,
+                            double.Parse(digits, CultureInfo.InvariantCulture));
+                    return MakeSigned(digits, raw, start);
+                default:
+                    _diagnostics.Report(ErrorCode.InvalidNumericLiteral, start,
+                        $"数字字面量后缀 '{suffix}' 无效。");
+                    return new Token(SyntaxKind.IntLiteral, raw, start, 0);
+            }
+        }
+        catch (Exception ex) when (ex is FormatException or OverflowException)
+        {
+            _diagnostics.Report(ErrorCode.InvalidNumericLiteral, start,
+                $"数字字面量 '{raw}' 无法表示。");
+            return new Token(SyntaxKind.IntLiteral, raw, start, 0);
+        }
+    }
+
+    private static Token MakeSigned(string digits, string raw, SourcePosition start)
+    {
+        if (int.TryParse(digits, CultureInfo.InvariantCulture, out var i))
+            return new Token(SyntaxKind.IntLiteral, raw, start, i);
+        if (long.TryParse(digits, CultureInfo.InvariantCulture, out var l))
+            return new Token(SyntaxKind.LongLiteral, raw, start, l);
+        return new Token(SyntaxKind.ULongLiteral, raw, start,
+            ulong.Parse(digits, CultureInfo.InvariantCulture));
+    }
+
+    private static Token MakeUnsigned(string digits, string raw, SourcePosition start, bool forceLong)
+    {
+        if (!forceLong && uint.TryParse(digits, CultureInfo.InvariantCulture, out var u))
+            return new Token(SyntaxKind.UIntLiteral, raw, start, u);
+        return new Token(SyntaxKind.ULongLiteral, raw, start,
+            ulong.Parse(digits, CultureInfo.InvariantCulture));
+    }
+
+    private Token ReadHex(SourcePosition start)
+    {
+        var begin = _pos;
+        _pos += 2;
+        var digitsStart = _pos;
+        while (_pos < _text.Length && (Uri.IsHexDigit(Current) || Current == '_')) _pos++;
+        var digits = _text[digitsStart.._pos].Replace("_", string.Empty);
+        var suffix = ReadNumericSuffix();
+        var raw = _text[begin.._pos];
+
+        if (digits.Length == 0)
+        {
+            _diagnostics.Report(ErrorCode.InvalidNumericLiteral, start, "十六进制字面量缺少数字。");
+            return new Token(SyntaxKind.IntLiteral, raw, start, 0);
+        }
+
+        return DecodeIntegral(Convert.ToUInt64(digits, 16), suffix, raw, start);
+    }
+
+    private Token ReadBinary(SourcePosition start)
+    {
+        var begin = _pos;
+        _pos += 2;
+        var digitsStart = _pos;
+        while (_pos < _text.Length && (Current is '0' or '1' or '_')) _pos++;
+        var digits = _text[digitsStart.._pos].Replace("_", string.Empty);
+        var suffix = ReadNumericSuffix();
+        var raw = _text[begin.._pos];
+
+        if (digits.Length == 0)
+        {
+            _diagnostics.Report(ErrorCode.InvalidNumericLiteral, start, "二进制字面量缺少数字。");
+            return new Token(SyntaxKind.IntLiteral, raw, start, 0);
+        }
+
+        return DecodeIntegral(Convert.ToUInt64(digits, 2), suffix, raw, start);
+    }
+
+    private static Token DecodeIntegral(ulong value, string suffix, string raw, SourcePosition start)
+    {
+        switch (suffix.ToUpperInvariant())
+        {
+            case "U": return new Token(SyntaxKind.UIntLiteral, raw, start, (uint)value);
+            case "L": return new Token(SyntaxKind.LongLiteral, raw, start, (long)value);
+            case "UL":
+            case "LU": return new Token(SyntaxKind.ULongLiteral, raw, start, value);
+            default:
+                if (value <= int.MaxValue) return new Token(SyntaxKind.IntLiteral, raw, start, (int)value);
+                if (value <= uint.MaxValue) return new Token(SyntaxKind.UIntLiteral, raw, start, (uint)value);
+                if (value <= long.MaxValue) return new Token(SyntaxKind.LongLiteral, raw, start, (long)value);
+                return new Token(SyntaxKind.ULongLiteral, raw, start, value);
+        }
+    }
+
+    private Token ReadString(SourcePosition start)
+    {
+        var begin = _pos;
+        _pos++; // opening quote
+        var sb = new StringBuilder();
+
+        while (true)
+        {
+            if (_pos >= _text.Length || Current == '\n')
+            {
+                _diagnostics.Report(ErrorCode.UnterminatedString, start, "字符串字面量未闭合。");
+                return new Token(SyntaxKind.StringLiteral, _text[begin..Math.Min(_pos, _text.Length)], start, sb.ToString());
+            }
+
+            if (Current == '"') { _pos++; break; }
+
+            if (Current == '\\')
+            {
+                _pos++;
+                if (!TryReadEscape(out var decoded))
+                    continue;
+                sb.Append(decoded);
+            }
+            else
+            {
+                sb.Append(Current);
+                _pos++;
+            }
+        }
+
+        return new Token(SyntaxKind.StringLiteral, _text[begin.._pos], start, sb.ToString());
+    }
+
+    private Token ReadChar(SourcePosition start)
+    {
+        var begin = _pos;
+        _pos++; // opening quote
+        char value;
+
+        if (_pos >= _text.Length)
+        {
+            _diagnostics.Report(ErrorCode.UnterminatedString, start, "字符字面量未闭合。");
+            return new Token(SyntaxKind.CharLiteral, "'", start, '\0');
+        }
+
+        if (Current == '\\')
+        {
+            _pos++;
+            value = TryReadEscape(out var decoded) ? decoded : '\0';
+        }
+        else
+        {
+            value = Current;
+            _pos++;
+        }
+
+        if (Current == '\'') _pos++;
+        else _diagnostics.Report(ErrorCode.UnterminatedString, start, "字符字面量未闭合。");
+
+        return new Token(SyntaxKind.CharLiteral, _text[begin.._pos], start, value);
+    }
+
+    private bool TryReadEscape(out char value)
+    {
+        var escapeStart = Here;
+        var c = Current;
+        _pos++;
+
+        switch (c)
+        {
+            case 'n': value = '\n'; return true;
+            case 't': value = '\t'; return true;
+            case 'r': value = '\r'; return true;
+            case '0': value = '\0'; return true;
+            case 'a': value = '\a'; return true;
+            case 'b': value = '\b'; return true;
+            case 'f': value = '\f'; return true;
+            case 'v': value = '\v'; return true;
+            case '\\': value = '\\'; return true;
+            case '\'': value = '\''; return true;
+            case '"': value = '"'; return true;
+            case 'u':
+            {
+                var digits = 0;
+                var code = 0;
+                while (digits < 4 && Uri.IsHexDigit(Current))
+                {
+                    code = code * 16 + Convert.ToInt32(Current.ToString(), 16);
+                    _pos++;
+                    digits++;
+                }
+                if (digits != 4)
+                {
+                    _diagnostics.Report(ErrorCode.InvalidEscapeSequence, escapeStart,
+                        "'\\u' 转义需要 4 位十六进制数字。");
+                    value = '\0';
+                    return false;
+                }
+                value = (char)code;
+                return true;
+            }
+            default:
+                _diagnostics.Report(ErrorCode.InvalidEscapeSequence, escapeStart,
+                    $"无法识别的转义序列 '\\{c}'。");
+                value = c;
+                return true;
+        }
+    }
+
+    private Token ReadPunctuation(SourcePosition start)
+    {
+        var c = Current;
+        var n = Peek();
+        var n2 = Peek(2);
+
+        SyntaxKind kind;
+        int length;
+
+        switch (c)
+        {
+            case '(': kind = SyntaxKind.OpenParen; length = 1; break;
+            case ')': kind = SyntaxKind.CloseParen; length = 1; break;
+            case '{': kind = SyntaxKind.OpenBrace; length = 1; break;
+            case '}': kind = SyntaxKind.CloseBrace; length = 1; break;
+            case '[': kind = SyntaxKind.OpenBracket; length = 1; break;
+            case ']': kind = SyntaxKind.CloseBracket; length = 1; break;
+            case ',': kind = SyntaxKind.Comma; length = 1; break;
+            case ';': kind = SyntaxKind.Semicolon; length = 1; break;
+            case ':': kind = SyntaxKind.Colon; length = 1; break;
+            case '~': kind = SyntaxKind.Tilde; length = 1; break;
+            case '.': kind = SyntaxKind.Dot; length = 1; break;
+
+            case '?':
+                if (n == '?' && n2 == '=') { kind = SyntaxKind.QuestionQuestionEquals; length = 3; }
+                else if (n == '?') { kind = SyntaxKind.QuestionQuestion; length = 2; }
+                else if (n == '.') { kind = SyntaxKind.QuestionDot; length = 2; }
+                else if (n == '[') { kind = SyntaxKind.QuestionDot; length = 1; } // ?[  -> handled by parser
+                else { kind = SyntaxKind.Question; length = 1; }
+                break;
+
+            case '+':
+                if (n == '+') { kind = SyntaxKind.PlusPlus; length = 2; }
+                else if (n == '=') { kind = SyntaxKind.PlusEquals; length = 2; }
+                else { kind = SyntaxKind.Plus; length = 1; }
+                break;
+
+            case '-':
+                if (n == '-') { kind = SyntaxKind.MinusMinus; length = 2; }
+                else if (n == '=') { kind = SyntaxKind.MinusEquals; length = 2; }
+                else { kind = SyntaxKind.Minus; length = 1; }
+                break;
+
+            case '*': (kind, length) = n == '=' ? (SyntaxKind.StarEquals, 2) : (SyntaxKind.Star, 1); break;
+            case '/': (kind, length) = n == '=' ? (SyntaxKind.SlashEquals, 2) : (SyntaxKind.Slash, 1); break;
+            case '%': (kind, length) = n == '=' ? (SyntaxKind.PercentEquals, 2) : (SyntaxKind.Percent, 1); break;
+            case '^': (kind, length) = n == '=' ? (SyntaxKind.CaretEquals, 2) : (SyntaxKind.Caret, 1); break;
+            case '!': (kind, length) = n == '=' ? (SyntaxKind.BangEquals, 2) : (SyntaxKind.Bang, 1); break;
+
+            case '&':
+                if (n == '&') { kind = SyntaxKind.AmpAmp; length = 2; }
+                else if (n == '=') { kind = SyntaxKind.AmpEquals; length = 2; }
+                else { kind = SyntaxKind.Amp; length = 1; }
+                break;
+
+            case '|':
+                if (n == '|') { kind = SyntaxKind.PipePipe; length = 2; }
+                else if (n == '=') { kind = SyntaxKind.PipeEquals; length = 2; }
+                else { kind = SyntaxKind.Pipe; length = 1; }
+                break;
+
+            case '=':
+                if (n == '=') { kind = SyntaxKind.EqualsEquals; length = 2; }
+                else if (n == '>') { kind = SyntaxKind.Arrow; length = 2; }
+                else { kind = SyntaxKind.Equals; length = 1; }
+                break;
+
+            case '<':
+                if (n == '<' && n2 == '=') { kind = SyntaxKind.LessLessEquals; length = 3; }
+                else if (n == '<') { kind = SyntaxKind.LessLess; length = 2; }
+                else if (n == '=') { kind = SyntaxKind.LessEquals; length = 2; }
+                else { kind = SyntaxKind.Less; length = 1; }
+                break;
+
+            case '>':
+                // Plain '>>' is produced by the parser from two '>' tokens so that generic type
+                // arguments such as List<List<int>> still close correctly. '>>=' is safe to lex
+                // as one token because no generic argument list can be followed directly by '='.
+                if (n == '>' && n2 == '=') { kind = SyntaxKind.GreaterGreaterEquals; length = 3; }
+                else if (n == '=') { kind = SyntaxKind.GreaterEquals; length = 2; }
+                else { kind = SyntaxKind.Greater; length = 1; }
+                break;
+
+            default:
+                _diagnostics.Report(ErrorCode.UnexpectedCharacter, start,
+                    $"无法识别的字符 '{c}'。");
+                _pos++;
+                return new Token(SyntaxKind.BadToken, c.ToString(), start);
+        }
+
+        var text = _text.Substring(_pos, length);
+        _pos += length;
+        return new Token(kind, text, start);
+    }
+}

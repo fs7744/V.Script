@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>V.Script.Benchmarks</AssemblyName>
+    <RootNamespace>V.Script.Benchmarks</RootNamespace>
+    <Optimize>true</Optimize>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <!-- The engine always emits runtime-async IL. Compile the hand-written baselines the same
+         way, otherwise the comparison is runtime-async against a classic state machine. -->
+    <Features>runtime-async=on</Features>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" Version="0.15.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\V.Script\V.Script.csproj" />
+  </ItemGroup>
+
+</Project>
