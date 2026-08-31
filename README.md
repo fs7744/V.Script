@@ -13,6 +13,9 @@ using var pricing = engine.Compile<PricingContext, decimal>(
 decimal total = pricing.Run(context);
 ```
 
+设计文档在 [`docs/design.md`](docs/design.md)：为什么这样设计、每条决定的实测依据、完整的语言
+覆盖面清单。本文只讲怎么用。
+
 ## Requirements
 
 .NET 11 SDK. The engine depends on **runtime async**, which is a .NET 11 runtime feature: the
@@ -353,8 +356,12 @@ src/V.Script/
   Runtime/      ScriptEngine, Script, ScriptHost,
                 ScriptClosure, ClosureBinder          — public API and generated-code contract
   Diagnostics/  Diagnostic, DiagnosticBag, ErrorCode
-tests/V.Script.Tests/       397 tests, including the differential suite
+tests/V.Script.Tests/       399 tests, including the differential suite
 bench/V.Script.Benchmarks/  execution, compilation, async, lambda and pattern benchmarks
+tools/V.Script.Probe/       compiles a list of C# constructs; produces the coverage table
+tools/V.Script.RuntimeAsyncCheck/
+                            verifies the runtime-async facts the async carrier depends on
+docs/design.md              design rationale, measurements, coverage
 ```
 
 The load-bearing invariant: **the binder makes everything explicit, the emitter only picks
@@ -375,6 +382,14 @@ address of a `DynamicMethod`, so it asks the host for the delegate instead — t
 dotnet build V.Script.slnx
 dotnet test tests/V.Script.Tests
 dotnet run --project bench/V.Script.Benchmarks -c Release -- --filter "*"
+```
+
+Two verification tools back the claims in the design document, and both are worth re-running
+after an SDK bump — the second one especially, since the whole asynchronous design rests on it:
+
+```bash
+dotnet run --project tools/V.Script.Probe -c Release
+dotnet run --project tools/V.Script.RuntimeAsyncCheck -c Release
 ```
 
 Benchmarks run in-process: BenchmarkDotNet 0.15.x does not yet recognise the `net11.0` moniker,
