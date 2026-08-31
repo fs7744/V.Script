@@ -15,7 +15,83 @@ public sealed class LocalSymbol(string name, Type type, bool isCompilerGenerated
     /// <summary>Assigned by the binder once the whole method is bound.</summary>
     public int Slot { get; internal set; } = -1;
 
-    public override string ToString() => $"{TypeResolver.Display(Type)} {Name} (slot {Slot})";
+    /// <summary>
+    /// For a lambda parameter, its index among the lambda method's arguments (argument 0 is
+    /// always the closure). -1 for ordinary locals.
+    /// </summary>
+    public int LambdaArgIndex { get; internal set; } = -1;
+
+    public bool IsLambdaParameter => LambdaArgIndex >= 0;
+
+    /// <summary>
+    /// Which function declared this variable: 0 for the script body, 1+ inside a lambda.
+    /// A reference from a deeper function is what makes the variable captured.
+    /// </summary>
+    internal int FunctionDepth { get; set; }
+
+    /// <summary>The scope this variable was declared in; it is the scope that would capture it.</summary>
+    internal ClosureScope? DeclaringScope { get; set; }
+
+    /// <summary>Set when some lambda reads this variable; it then lives in a closure, not an IL local.</summary>
+    public ClosureScope? Closure { get; internal set; }
+
+    public int ClosureSlot { get; internal set; } = -1;
+
+    public bool IsCaptured => Closure is not null;
+
+    public override string ToString() =>
+        $"{TypeResolver.Display(Type)} {Name}" + (IsCaptured ? $" (closure slot {ClosureSlot})" : $" (slot {Slot})");
+}
+
+/// <summary>
+/// The set of captured variables belonging to one lexical scope. A scope only becomes a real
+/// <see cref="ScriptClosure"/> at run time if something was actually captured from it, and it is
+/// instantiated on every entry — so a loop body allocates one per iteration, which is what makes
+/// a captured <c>foreach</c> variable behave per-iteration as it does in C#.
+/// </summary>
+public sealed class ClosureScope(ClosureScope? parent)
+{
+    private readonly List<LocalSymbol> _slots = [];
+
+    public ClosureScope? Parent { get; } = parent;
+
+    public IReadOnlyList<LocalSymbol> Slots => _slots;
+
+    /// <summary>False when nothing was captured here, in which case no instance is created.</summary>
+    public bool IsMaterialized => _slots.Count > 0;
+
+    /// <summary>The nearest enclosing scope that does get an instance, or null.</summary>
+    public ClosureScope? MaterializedParent
+    {
+        get
+        {
+            for (var scope = Parent; scope is not null; scope = scope.Parent)
+                if (scope.IsMaterialized)
+                    return scope;
+            return null;
+        }
+    }
+
+    public void Capture(LocalSymbol local)
+    {
+        if (local.Closure is not null) return;
+
+        local.Closure = this;
+        local.ClosureSlot = _slots.Count;
+        _slots.Add(local);
+    }
+
+    /// <summary>Number of <c>Parent</c> hops from this scope to <paramref name="target"/>, or -1.</summary>
+    public int HopsTo(ClosureScope target)
+    {
+        var hops = 0;
+        for (var scope = this; scope is not null; scope = scope.MaterializedParent)
+        {
+            if (ReferenceEquals(scope, target)) return hops;
+            hops++;
+        }
+        return -1;
+    }
 }
 
 public enum BoundBinaryKind
@@ -195,6 +271,37 @@ public sealed record BoundIntrinsic(SourcePosition Position, Type Type, Intrinsi
     : BoundExpression(Position, Type);
 
 /// <summary>
+/// A lambda before a target type is known. C# anonymous functions have no type of their own, so
+/// this survives until overload resolution picks the parameter it converts to.
+/// </summary>
+public sealed record BoundUnboundLambda(
+    SourcePosition Position,
+    Syntax.LambdaExpressionSyntax Syntax) : BoundExpression(Position, Conversions.LambdaType);
+
+/// <summary>A lambda bound against a concrete delegate type; the emitter gives it its own method.</summary>
+public sealed record BoundLambda(
+    SourcePosition Position,
+    Type Type,
+    IReadOnlyList<LocalSymbol> Parameters,
+    IReadOnlyList<LocalSymbol> Locals,
+    BoundExpression Body,
+    Type ReturnType,
+    ClosureScope OwnScope,
+    ClosureScope? EnclosingClosure) : BoundExpression(Position, Type)
+{
+    /// <summary>Index into the host's lambda table; assigned by the emitter.</summary>
+    public int Index { get; internal set; } = -1;
+}
+
+/// <summary>Invoking a delegate-typed value, as opposed to calling a named method.</summary>
+public sealed record BoundDelegateInvoke(
+    SourcePosition Position,
+    Type Type,
+    BoundExpression Target,
+    System.Reflection.MethodInfo Invoke,
+    IReadOnlyList<BoundExpression> Arguments) : BoundExpression(Position, Type);
+
+/// <summary>
 /// Intermediate node standing for a type name used as the receiver of a static member access.
 /// It never survives to emission; the binder reports an error if one is used as a value.
 /// </summary>
@@ -205,8 +312,10 @@ public sealed record BoundTypeReference(SourcePosition Position, Type Referenced
 
 public abstract record BoundStatement(SourcePosition Position);
 
-public sealed record BoundBlock(SourcePosition Position, IReadOnlyList<BoundStatement> Statements)
-    : BoundStatement(Position);
+public sealed record BoundBlock(
+    SourcePosition Position,
+    IReadOnlyList<BoundStatement> Statements,
+    ClosureScope? Closure = null) : BoundStatement(Position);
 
 public sealed record BoundNop(SourcePosition Position) : BoundStatement(Position);
 
@@ -240,7 +349,8 @@ public sealed record BoundFor(
     IReadOnlyList<BoundStatement> Initializers,
     BoundExpression? Condition,
     IReadOnlyList<BoundStatement> Incrementors,
-    BoundStatement Body) : BoundStatement(Position);
+    BoundStatement Body,
+    ClosureScope? Closure = null) : BoundStatement(Position);
 
 public sealed record BoundReturn(SourcePosition Position, BoundExpression? Expression)
     : BoundStatement(Position);
@@ -272,4 +382,6 @@ public sealed record BoundScript(
     Type ReturnType,
     IReadOnlyList<LocalSymbol> Locals,
     bool IsAsync,
-    bool UsesCheckpoints);
+    bool UsesCheckpoints,
+    ClosureScope RootScope,
+    IReadOnlyList<BoundLambda> Lambdas);

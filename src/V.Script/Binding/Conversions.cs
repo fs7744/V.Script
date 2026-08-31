@@ -128,6 +128,9 @@ public static class Conversions
         if (from == NullLiteralType)
             return IsNullAssignable(to) ? new Conversion(ConversionKind.ImplicitNullLiteral) : Conversion.None;
 
+        // Lambdas are converted by the binder once a target delegate type is known, never here.
+        if (from == LambdaType || to == LambdaType) return Conversion.None;
+
         if (to == typeof(void) || from == typeof(void)) return Conversion.None;
 
         // --- nullable value types -------------------------------------------------
@@ -243,6 +246,26 @@ public static class Conversions
         private NullLiteralSentinel() { }
     }
 
+    /// <summary>
+    /// Sentinel standing in for a lambda that has not been given a target type yet. A lambda is
+    /// convertible only to a delegate, and only overload resolution can say which one, so it
+    /// carries this until a parameter type is chosen.
+    /// </summary>
+    public static readonly Type LambdaType = typeof(LambdaSentinel);
+
+    public sealed class LambdaSentinel
+    {
+        private LambdaSentinel() { }
+    }
+
+    public static bool IsDelegateType(Type type) =>
+        typeof(Delegate).IsAssignableFrom(type) &&
+        type != typeof(Delegate) &&
+        type != typeof(MulticastDelegate);
+
+    public static MethodInfo? GetInvokeMethod(Type delegateType) =>
+        IsDelegateType(delegateType) ? delegateType.GetMethod("Invoke") : null;
+
     public static bool HasImplicit(Type from, Type to) => Classify(from, to).IsImplicit;
 
     /// <summary>
@@ -261,8 +284,29 @@ public static class Conversions
 
         if (rightFromLeft && !leftFromRight) return -1;
         if (leftFromRight && !rightFromLeft) return 1;
-        return 0;
+
+        // Neither target subsumes the other, so fall back to how the argument reaches each one.
+        // A reference conversion is a better fit than a user-defined one, which is what keeps
+        // an array binding to IEnumerable<T> rather than to ReadOnlySpan<T>.
+        var leftRank = Rank(Classify(source, left).Kind);
+        var rightRank = Rank(Classify(source, right).Kind);
+
+        return leftRank.CompareTo(rightRank);
     }
+
+    /// <summary>Lower is a closer fit. Used only to break ties that betterness leaves open.</summary>
+    private static int Rank(ConversionKind kind) => kind switch
+    {
+        ConversionKind.Identity => 0,
+        ConversionKind.ImplicitReference => 1,
+        ConversionKind.Boxing => 2,
+        ConversionKind.ImplicitNumeric => 3,
+        ConversionKind.ImplicitNullable => 4,
+        ConversionKind.ImplicitEnumeration => 5,
+        ConversionKind.ImplicitNullLiteral => 6,
+        ConversionKind.ImplicitUserDefined => 7,
+        _ => 8,
+    };
 
     public static bool TryGetElementType(Type collection, [NotNullWhen(true)] out Type? elementType)
     {

@@ -2,7 +2,7 @@
 
 A lightweight script execution engine for .NET 11. Scripts are a subset of C# statements, they
 bind against the real CLR type system, and they compile straight to IL — no Roslyn, no
-interpreter, and `async`/`await` works for real.
+interpreter. Lambdas, closures and LINQ work, and so does `async`/`await`.
 
 ```csharp
 using var engine = new ScriptEngine();
@@ -66,6 +66,36 @@ using var script = engine.Compile<PricingContext, decimal>("""
 
 A script whose last statement is a bare expression returns it, so `"Price * Quantity"` needs no
 `return` and no trailing semicolon.
+
+### Lambdas, closures and LINQ
+
+```csharp
+var script = engine.Compile<OrderContext, decimal>(
+    """
+    var floor = MinimumQuantity;
+    return Order.Items
+        .Where(i => i.Quantity >= floor)
+        .Sum(i => i.Price * i.Quantity);
+    """);
+```
+
+That one expression exercises everything the three features have to do together: an extension
+method found through the imported namespaces, generic type arguments inferred from the sequence
+*and* from the lambda body's own type, and `floor` captured from the enclosing scope.
+
+Capture is by reference, as in C# — the enclosing script and the lambda share one storage slot,
+so a later write is visible to both:
+
+```csharp
+var factor = 3;
+Func<int, int> f = x => x * factor;
+factor = 10;
+return f(5);          // 50
+```
+
+Scope lifetime follows C# too. A `foreach` variable is fresh each iteration, so lambdas that
+outlive the loop each keep their own value; a `for` loop variable is one variable for the whole
+loop, so they all see the last one. Both are covered by tests.
 
 ### Asynchronous scripts
 
@@ -152,27 +182,37 @@ compound assignment, `++`/`--`, full arithmetic/relational/logical/bitwise opera
 numeric promotion and nullable lifting, `?.` `??` `??=` `is` `as` `typeof`, casts, member and
 static access, indexers, method calls with overload resolution (`params`, optional and named
 arguments), operator overloading and user-defined conversions, object creation, `if`/`while`/
-`do`/`for`/`foreach`/`break`/`continue`/`return`, `try`/`catch`/`finally`/`throw`, and `await`.
+`do`/`for`/`foreach`/`break`/`continue`/`return`, `try`/`catch`/`finally`/`throw`, `await`,
+lambdas with by-reference capture, generic method type inference, and extension methods — the
+last three together being what makes LINQ usable.
 
-Not implemented yet, each with its own diagnostic rather than a confusing type error:
+Restrictions worth knowing, each with its own diagnostic:
 
-- lambdas and closures (`VS9001`)
-- generic method type inference (`VS9002`)
-- extension methods (`VS9003`), which together with the previous item is why LINQ does not work
+| | Code | Why |
+|---|---|---|
+| Lambda bodies must be expressions, not `{ }` blocks | `VS9005` | A block can contain a loop, and lambda methods carry no budget checkpoint |
+| No `await` inside a lambda | `VS9006` | A lambda compiles to a separate synchronous method, which cannot hold a suspension point |
+| No `await` inside `catch` or `finally` | `VS3004` | The runtime terminates the process instead of throwing — see below |
+| `var` cannot infer a lambda's type | `VS2017` | Same rule as C#; write the delegate type |
 
+Type inference does not read method groups (`xs.Select(Foo)`), and a type parameter inferred
+from several arguments takes the first binding rather than computing a best common type.
 Pattern matching (`x is Type y`, `switch` expressions) is not parsed at all and reports an
 ordinary syntax error rather than a dedicated code.
 
-Deliberately impossible: `await` inside `catch` or `finally`. The runtime does not protect
-suspension points inside a handler — it crashes the process rather than throwing — so the binder
-rejects it unconditionally with `VS3004`. `await` inside a `try` *block* is fine.
+The `await`-in-a-handler restriction is unconditional and cannot be switched off. The runtime
+gives no protection there: a suspension point inside `catch` or `finally` terminates the process
+rather than raising a catchable error, and — the trap — `finally` appears to work until the
+first time it runs during exception unwinding. `await` inside a `try` *block* is fine.
 
 ## Type-system fidelity
 
 The engine has no value model of its own; `System.Type` is the type system. Numeric promotion
-follows ECMA-334 §12.4.7, conversions follow §10, and overload resolution implements a
-documented subset of §12.6.4 (no lambda return-type inference in betterness, no generic
-inference, no `ref`/`out`).
+follows ECMA-334 §12.4.7, conversions follow §10, overload resolution implements a documented
+subset of §12.6.4, and generic inference the shape of §12.6.3 that ordinary calls need. Lambda
+arguments do take part in betterness: `Sum(Func<T,int>)` beats `Sum(Func<T,double>)` for a lambda
+that produces an `int`, which is what makes the LINQ overload sets resolve at all. Not covered:
+`ref`/`out` parameters, method-group inference, and constraint re-inference.
 
 The evidence for that is differential testing: `DifferentialTests` evaluates the same expression
 with the real C# compiler and with the engine over a corpus of edge values — `int.MinValue`,
@@ -217,25 +257,49 @@ The gap in the last row is the per-invocation `CancellationTokenSource` and time
 `Timeout`, not the generated code. Leaving `Timeout` null and passing your own token keeps
 cancellation working without it.
 
+Lambdas and LINQ:
+
+| | hand-written C# | script | allocated |
+|---|---:|---:|---:|
+| predicate, no capture | 4.3 ns | 19.9 ns | 0 B |
+| predicate, capturing | — | 68.3 ns | 184 B |
+| LINQ `Where`/`Select`/`Sum` | 35.6 ns | 59.6 ns | 104 B |
+| `decimal` projection over 3 items | 44.1 ns | 49.8 ns | 40 B |
+
+A non-capturing lambda costs nothing per evaluation — its delegate is built once at compile
+time. A capturing one allocates its closure and binds a delegate to it on every evaluation.
+Doing that with `DynamicMethod.CreateDelegate` measured 419 ns; pre-building the open delegate
+at compile time and wrapping it instead brought it to 68 ns, which is why `ClosureBinder` exists.
+
+The remaining gap on the non-capturing predicate is inlining: the JIT inlines a C# lambda into
+its caller, while the script's delegate stays opaque.
+
 ## Layout
 
 ```
 src/V.Script/
   Syntax/       Lexer, Parser, syntax tree            — source to AST
-  Binding/      Binder, Conversions, NumericPromotion,
-                OverloadResolution, TypeResolver      — AST to BoundTree; all semantics live here
+  Binding/      Binder, Conversions, NumericPromotion, OverloadResolution,
+                GenericInference, TypeResolver        — AST to BoundTree; all semantics live here
   Emit/         IlEmitter, ScriptCarrier              — BoundTree to IL; no type analysis
-  Runtime/      ScriptEngine, Script, ScriptState     — public API and per-invocation state
+  Runtime/      ScriptEngine, Script, ScriptState,
+                ScriptClosure, ClosureBinder          — public API and per-invocation state
   Diagnostics/  Diagnostic, DiagnosticBag, ErrorCode
-tests/V.Script.Tests/       292 tests, including the differential suite
-bench/V.Script.Benchmarks/  execution, compilation and async benchmarks
+tests/V.Script.Tests/       339 tests, including the differential suite
+bench/V.Script.Benchmarks/  execution, compilation, async and lambda benchmarks
 ```
 
 The load-bearing invariant: **the binder makes everything explicit, the emitter only picks
 opcodes**. Conversions become `BoundConversion` nodes, nullable lifting is expanded, overloads
 resolve to a concrete `MethodInfo`, `params` becomes an array node, `foreach` and compound
-assignment are lowered into existing nodes. A `if (type == typeof(...))` inside `IlEmitter` is a
-design leak.
+assignment are lowered into existing nodes, and which variables are captured — and into which
+scope — is decided during binding. An `if (type == typeof(...))` inside `IlEmitter` is a design
+leak.
+
+One consequence worth spelling out: a lambda is always a separate `DynamicMethod` taking its
+closure as argument 0, even inside an asynchronous script. Generated code cannot take the
+address of a `DynamicMethod`, so it asks the host for the delegate instead — that is what
+`ScriptHost` and `ClosureBinder` are for.
 
 ## Building
 

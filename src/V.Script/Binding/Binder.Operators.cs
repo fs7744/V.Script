@@ -16,6 +16,16 @@ internal sealed partial class Binder
     {
         if (expression is BoundErrorExpression) return expression;
 
+        // A lambda has no type of its own; converting one *is* binding it.
+        if (expression is BoundUnboundLambda unbound)
+        {
+            if (Conversions.IsDelegateType(target)) return BindLambda(unbound.Syntax, target);
+
+            _diagnostics.Report(ErrorCode.CannotConvert, position,
+                $"lambda 只能转换为委托类型，{TypeResolver.Display(target)} 不是委托。");
+            return new BoundErrorExpression(position);
+        }
+
         if (expression is BoundNullLiteral)
         {
             if (Conversions.IsNullableValueType(target)) return new BoundDefault(position, target);

@@ -175,3 +175,62 @@ public sealed class AsyncService
         throw new InvalidOperationException("boom");
     }
 }
+
+// ---------------------------------------------------------------- lambda shapes
+
+public sealed class LambdaGlobals
+{
+    public int[] Numbers { get; init; } = [];
+    public List<int> Values { get; init; } = [];
+    public int Threshold { get; init; }
+    public string Label { get; init; } = "";
+    public Func<int, int>? Transform { get; init; }
+    public Functional Fn { get; init; } = new();
+    public List<Func<int>> Sink { get; init; } = [];
+    public Counter Counter { get; init; } = new();
+}
+
+public sealed class Counter
+{
+    public int Total;
+    public void Add(int value) => Total += value;
+}
+
+/// <summary>Methods that take delegates, for lambda binding and overload resolution.</summary>
+public sealed class Functional
+{
+    public int Apply(Func<int, int> f, int x) => f(x);
+
+    public int Apply(Func<int, int> f) => f(1);
+
+    public int Apply(int x) => x * 100;
+
+    public int Fold(int[] values, int seed, Func<int, int, int> combine)
+    {
+        var acc = seed;
+        foreach (var value in values) acc = combine(acc, value);
+        return acc;
+    }
+
+    public bool AnyMatch(int[] values, Func<int, bool> predicate)
+    {
+        foreach (var value in values) if (predicate(value)) return true;
+        return false;
+    }
+
+    public int CountMatching(int[] values, Func<int, bool> predicate)
+    {
+        var count = 0;
+        foreach (var value in values) if (predicate(value)) count++;
+        return count;
+    }
+
+    public void Each(int[] values, Action<int> action)
+    {
+        foreach (var value in values) action(value);
+    }
+
+    public string Produce(Func<string> factory) => factory();
+
+    public Func<int, int> Compose(Func<int, int> outer, Func<int, int> inner) => x => outer(inner(x));
+}

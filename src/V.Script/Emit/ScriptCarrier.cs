@@ -38,7 +38,7 @@ internal static class ScriptCarrier
             typeof(ScriptCarrier).Module,
             skipVisibility: true);
 
-        new IlEmitter(method.GetILGenerator(), script, hasCancellationToken).Emit();
+        IlEmitter.EmitScript(method.GetILGenerator(), script, hasCancellationToken, host);
 
         return (method.CreateDelegate(delegateType, host), null);
     }
@@ -77,7 +77,7 @@ internal static class ScriptCarrier
         method.SetImplementationFlags(
             MethodImplAttributes.IL | MethodImplAttributes.Managed | AsyncImplFlag);
 
-        new IlEmitter(method.GetILGenerator(), script, hasCancellationToken).Emit();
+        IlEmitter.EmitScript(method.GetILGenerator(), script, hasCancellationToken, host);
 
         var created = type.CreateType()!;
         var runtimeMethod = created.GetMethod("Run", BindingFlags.Public | BindingFlags.Static)!;

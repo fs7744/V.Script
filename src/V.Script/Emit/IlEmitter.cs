@@ -8,10 +8,12 @@ namespace V.Script.Emit;
 /// Translates a <see cref="BoundScript"/> into IL. It targets a bare <see cref="ILGenerator"/>,
 /// which is what lets the same emitter serve both carriers: a <c>DynamicMethod</c> for
 /// synchronous scripts and a <c>MethodBuilder</c> marked <c>Async</c> for asynchronous ones.
+/// Lambdas always get their own <c>DynamicMethod</c>, whichever carrier the script itself uses.
 /// </summary>
 /// <remarks>
-/// By contract this class performs no type analysis. Every conversion, promotion and lifted
-/// operation was made explicit by the binder; the code below only chooses opcodes.
+/// By contract this class performs no type analysis. Every conversion, promotion, lifted
+/// operation and capture decision was made explicit by the binder; the code below only chooses
+/// opcodes.
 /// </remarks>
 internal sealed partial class IlEmitter
 {
@@ -19,24 +21,114 @@ internal sealed partial class IlEmitter
     private readonly BoundScript _script;
     private readonly bool _hasCancellationToken;
 
+    /// <summary>Set when emitting a lambda body rather than the script body.</summary>
+    private readonly BoundLambda? _lambda;
+
+    /// <summary>The scope that argument 0 refers to inside a lambda method; null in the script body.</summary>
+    private readonly ClosureScope? _incomingClosure;
+
     private readonly Dictionary<LocalSymbol, LocalBuilder> _locals = [];
+    private readonly Dictionary<ClosureScope, LocalBuilder> _closures = [];
+
     private LocalBuilder? _state;
     private LocalBuilder? _returnValue;
     private Label _returnLabel;
 
     private readonly Stack<(Label Break, Label Continue)> _loops = new();
 
-    public IlEmitter(ILGenerator il, BoundScript script, bool hasCancellationToken)
+    private IlEmitter(
+        ILGenerator il,
+        BoundScript script,
+        bool hasCancellationToken,
+        BoundLambda? lambda,
+        ClosureScope? incomingClosure)
     {
         _il = il;
         _script = script;
         _hasCancellationToken = hasCancellationToken;
+        _lambda = lambda;
+        _incomingClosure = incomingClosure;
     }
 
-    public void Emit()
+    /// <summary>
+    /// Emits the script body into <paramref name="il"/> and every lambda into its own
+    /// <see cref="DynamicMethod"/>, returning the table the host uses to build delegates.
+    /// </summary>
+    public static ScriptHost.LambdaEntry[] EmitScript(
+        ILGenerator il,
+        BoundScript script,
+        bool hasCancellationToken,
+        ScriptHost host)
     {
+        var lambdas = script.Lambdas;
+        var methods = new DynamicMethod[lambdas.Count];
+
+        for (var i = 0; i < lambdas.Count; i++)
+        {
+            lambdas[i].Index = i;
+            methods[i] = DefineLambdaMethod(lambdas[i], i);
+        }
+
+        new IlEmitter(il, script, hasCancellationToken, null, null).EmitBody();
+
+        var entries = new ScriptHost.LambdaEntry[lambdas.Count];
+        for (var i = 0; i < lambdas.Count; i++)
+        {
+            var lambda = lambdas[i];
+            var incoming = NearestMaterialized(lambda.EnclosingClosure);
+
+            new IlEmitter(methods[i].GetILGenerator(), script, false, lambda, incoming).EmitBody();
+
+            // A lambda with nothing to capture always receives the host's shared empty closure,
+            // so its delegate can be built once here instead of on every evaluation. A capturing
+            // one gets a factory that avoids CreateDelegate on the hot path.
+            var shared = incoming is null
+                ? methods[i].CreateDelegate(lambda.Type, host.EmptyClosure)
+                : null;
+
+            var factory = incoming is null
+                ? null
+                : ClosureBinder.TryCreateFactory(methods[i], lambda.Type);
+
+            entries[i] = new ScriptHost.LambdaEntry(methods[i], lambda.Type, shared, factory);
+        }
+
+        host.SetLambdas(entries);
+        return entries;
+    }
+
+    private static DynamicMethod DefineLambdaMethod(BoundLambda lambda, int index)
+    {
+        var parameterTypes = new Type[lambda.Parameters.Count + 1];
+        parameterTypes[0] = typeof(ScriptClosure);
+        for (var i = 0; i < lambda.Parameters.Count; i++)
+            parameterTypes[i + 1] = lambda.Parameters[i].Type;
+
+        return new DynamicMethod(
+            $"lambda{index}",
+            lambda.ReturnType,
+            parameterTypes,
+            typeof(IlEmitter).Module,
+            skipVisibility: true);
+    }
+
+    internal static ClosureScope? NearestMaterialized(ClosureScope? scope)
+    {
+        if (scope is null) return null;
+        return scope.IsMaterialized ? scope : scope.MaterializedParent;
+    }
+
+    private void EmitBody()
+    {
+        if (_lambda is not null)
+        {
+            EmitLambdaBody();
+            return;
+        }
+
         foreach (var local in _script.Locals)
-            _locals[local] = _il.DeclareLocal(local.Type);
+            if (!local.IsCaptured)
+                _locals[local] = _il.DeclareLocal(local.Type);
 
         if (_script.UsesCheckpoints) EmitStateInitialization();
 
@@ -49,6 +141,45 @@ internal sealed partial class IlEmitter
         _il.MarkLabel(_returnLabel);
         if (_returnValue is not null) _il.Emit(OpCodes.Ldloc, _returnValue);
         _il.Emit(OpCodes.Ret);
+    }
+
+    private void EmitLambdaBody()
+    {
+        var lambda = _lambda!;
+
+        foreach (var local in lambda.Locals)
+            if (!local.IsCaptured && !local.IsLambdaParameter)
+                _locals[local] = _il.DeclareLocal(local.Type);
+
+        // Only needed when a nested lambda captured one of this lambda's own parameters.
+        if (lambda.OwnScope.IsMaterialized)
+        {
+            EmitCreateClosure(lambda.OwnScope);
+
+            foreach (var parameter in lambda.Parameters)
+            {
+                if (!parameter.IsCaptured) continue;
+
+                EmitCapturedSlotAddress(parameter);
+                EmitLdarg(parameter.LambdaArgIndex);
+                if (parameter.Type.IsValueType) _il.Emit(OpCodes.Box, parameter.Type);
+                _il.Emit(OpCodes.Stelem_Ref);
+            }
+        }
+
+        // An Action's body is still an expression; its value has to be discarded before ret.
+        if (lambda.ReturnType == typeof(void)) EmitAsStatement(lambda.Body);
+        else EmitExpression(lambda.Body);
+
+        _il.Emit(OpCodes.Ret);
+    }
+
+    /// <summary>Pushes the <see cref="ScriptHost"/>: argument 0 in the script body, via the closure in a lambda.</summary>
+    private void EmitHost()
+    {
+        _il.Emit(OpCodes.Ldarg_0);
+        if (_lambda is not null)
+            _il.Emit(OpCodes.Callvirt, typeof(ScriptClosure).GetProperty(nameof(ScriptClosure.Host))!.GetMethod!);
     }
 
     private void EmitStateInitialization()
@@ -87,6 +218,7 @@ internal sealed partial class IlEmitter
         switch (statement)
         {
             case BoundBlock block:
+                if (block.Closure is not null) EmitCreateClosure(block.Closure);
                 foreach (var child in block.Statements) EmitStatement(child);
                 break;
 
@@ -145,17 +277,24 @@ internal sealed partial class IlEmitter
 
     private void EmitLocalDeclaration(BoundLocalDeclaration declaration)
     {
-        var local = _locals[declaration.Local];
+        var local = declaration.Local;
 
-        if (declaration.Initializer is null)
+        if (local.IsCaptured)
         {
-            EmitDefaultValue(declaration.Local.Type);
-            _il.Emit(OpCodes.Stloc, local);
+            EmitCapturedSlotAddress(local);
+
+            if (declaration.Initializer is null) EmitDefaultValue(local.Type);
+            else EmitExpression(declaration.Initializer);
+
+            if (local.Type.IsValueType) _il.Emit(OpCodes.Box, local.Type);
+            _il.Emit(OpCodes.Stelem_Ref);
             return;
         }
 
-        EmitExpression(declaration.Initializer);
-        _il.Emit(OpCodes.Stloc, local);
+        if (declaration.Initializer is null) EmitDefaultValue(local.Type);
+        else EmitExpression(declaration.Initializer);
+
+        _il.Emit(OpCodes.Stloc, _locals[local]);
     }
 
     private void EmitIf(BoundIf statement)
@@ -221,6 +360,8 @@ internal sealed partial class IlEmitter
 
     private void EmitFor(BoundFor loop)
     {
+        if (loop.Closure is not null) EmitCreateClosure(loop.Closure);
+
         foreach (var initializer in loop.Initializers) EmitStatement(initializer);
 
         var body = _il.DefineLabel();
@@ -278,10 +419,22 @@ internal sealed partial class IlEmitter
         {
             _il.BeginCatchBlock(clause.ExceptionType);
 
-            if (clause.Variable is not null)
-                _il.Emit(OpCodes.Stloc, _locals[clause.Variable]);
-            else
+            if (clause.Variable is null)
+            {
                 _il.Emit(OpCodes.Pop);
+            }
+            else if (clause.Variable.IsCaptured)
+            {
+                var pending = _il.DeclareLocal(clause.Variable.Type);
+                _il.Emit(OpCodes.Stloc, pending);
+                EmitCapturedSlotAddress(clause.Variable);
+                _il.Emit(OpCodes.Ldloc, pending);
+                _il.Emit(OpCodes.Stelem_Ref);
+            }
+            else
+            {
+                _il.Emit(OpCodes.Stloc, _locals[clause.Variable]);
+            }
 
             EmitStatement(clause.Body);
         }

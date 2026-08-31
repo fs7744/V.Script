@@ -14,7 +14,7 @@ internal sealed partial class IlEmitter
             case BoundLiteral literal: EmitLiteral(literal); break;
             case BoundNullLiteral: _il.Emit(OpCodes.Ldnull); break;
             case BoundDefault defaultValue: EmitDefaultValue(defaultValue.Type); break;
-            case BoundLocalAccess local: _il.Emit(OpCodes.Ldloc, _locals[local.Local]); break;
+            case BoundLocalAccess local: EmitLocalAccess(local.Local); break;
             case BoundParameterAccess parameter: EmitLdarg(parameter.Index); break;
             case BoundConversion conversion: EmitConversion(conversion); break;
             case BoundBinary binary: EmitBinary(binary); break;
@@ -36,14 +36,38 @@ internal sealed partial class IlEmitter
             case BoundTypeofExpression typeofExpression: EmitTypeof(typeofExpression); break;
             case BoundAssignment assignment: EmitAssignment(assignment, leaveValue: true); break;
             case BoundIntrinsic intrinsic: EmitIntrinsic(intrinsic); break;
+            case BoundLambda lambda: EmitLambda(lambda); break;
+            case BoundDelegateInvoke invocation: EmitDelegateInvoke(invocation); break;
 
             case BoundErrorExpression:
             case BoundTypeReference:
+            case BoundUnboundLambda:
                 throw new InvalidOperationException("绑定失败的表达式不应到达发射阶段。");
 
             default:
                 throw new InvalidOperationException($"未处理的表达式节点 {expression.GetType().Name}。");
         }
+    }
+
+    /// <summary>
+    /// Reads a variable. Where it lives was decided by the binder: an IL local, an argument of
+    /// the lambda method, or a slot in a closure.
+    /// </summary>
+    private void EmitLocalAccess(LocalSymbol local)
+    {
+        if (local.IsCaptured)
+        {
+            EmitCapturedLoad(local);
+            return;
+        }
+
+        if (local.IsLambdaParameter)
+        {
+            EmitLdarg(local.LambdaArgIndex);
+            return;
+        }
+
+        _il.Emit(OpCodes.Ldloc, _locals[local]);
     }
 
     // ============================================================ constants
@@ -740,8 +764,12 @@ internal sealed partial class IlEmitter
     {
         switch (expression)
         {
-            case BoundLocalAccess local:
+            case BoundLocalAccess { Local.IsCaptured: false, Local.IsLambdaParameter: false } local:
                 _il.Emit(OpCodes.Ldloca, _locals[local.Local]);
+                return;
+
+            case BoundLocalAccess { Local.IsLambdaParameter: true } local:
+                _il.Emit(OpCodes.Ldarga, local.Local.LambdaArgIndex);
                 return;
 
             case BoundParameterAccess parameter:
@@ -912,6 +940,20 @@ internal sealed partial class IlEmitter
         {
             case BoundLocalAccess local:
             {
+                if (local.Local.IsCaptured)
+                {
+                    EmitCapturedStore(local.Local, assignment.Value, leaveValue);
+                    return;
+                }
+
+                if (local.Local.IsLambdaParameter)
+                {
+                    EmitExpression(assignment.Value);
+                    if (leaveValue) _il.Emit(OpCodes.Dup);
+                    _il.Emit(OpCodes.Starg_S, (byte)local.Local.LambdaArgIndex);
+                    return;
+                }
+
                 EmitExpression(assignment.Value);
                 if (leaveValue) _il.Emit(OpCodes.Dup);
                 _il.Emit(OpCodes.Stloc, _locals[local.Local]);

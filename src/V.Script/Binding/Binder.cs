@@ -14,7 +14,7 @@ internal sealed record ScriptParameter(string Name, Type Type, int IlIndex, bool
 /// </summary>
 internal sealed partial class Binder
 {
-    private readonly DiagnosticBag _diagnostics;
+    private DiagnosticBag _diagnostics;
     private readonly TypeResolver _resolver;
     private readonly IReadOnlyList<ScriptParameter> _parameters;
     private readonly ScriptParameter? _globals;
@@ -22,8 +22,15 @@ internal sealed partial class Binder
     private readonly bool _isAsync;
     private readonly ScriptLimits _limits;
 
-    private readonly List<LocalSymbol> _locals = [];
+    private readonly List<BoundLambda> _lambdas = [];
+    private readonly ClosureScope _rootScope = new(null);
+    private readonly Dictionary<ScriptParameter, LocalSymbol> _parameterLocals = [];
+
+    private List<LocalSymbol> _locals = [];
     private Scope _scope;
+    private ClosureScope _closureScope;
+    private LocalSymbol? _globalsLocal;
+    private int _functionDepth;
     private int _loopDepth;
     private int _handlerDepth;
     private int _tempCounter;
@@ -45,11 +52,28 @@ internal sealed partial class Binder
         _isAsync = isAsync;
         _limits = limits;
         _scope = new Scope(null);
+        _closureScope = _rootScope;
     }
 
     public BoundScript BindScript(CompilationUnitSyntax unit)
     {
         var statements = new List<BoundStatement>();
+
+        // Copy the method's arguments into locals up front. An argument index means nothing
+        // inside a lambda's own method, so making parameters ordinary locals lets a lambda
+        // capture the globals object exactly the way it captures anything else.
+        foreach (var parameter in _parameters)
+        {
+            var local = new LocalSymbol(parameter.Name, parameter.Type, parameter.IsGlobals);
+            Register(local);
+            _scope.TryDeclare(local);
+            _parameterLocals[parameter] = local;
+
+            statements.Add(new BoundLocalDeclaration(unit.Position, local,
+                new BoundParameterAccess(unit.Position, parameter.Type, parameter.IlIndex)));
+        }
+
+        if (_globals is not null) _globalsLocal = _parameterLocals[_globals];
 
         for (var i = 0; i < unit.Statements.Count; i++)
         {
@@ -57,7 +81,8 @@ internal sealed partial class Binder
             statements.Add(BindTopLevelStatement(unit.Statements[i], isLast));
         }
 
-        var body = new BoundBlock(unit.Position, statements);
+        var body = new BoundBlock(unit.Position, statements,
+            _rootScope.IsMaterialized ? _rootScope : null);
 
         if (_returnType != typeof(void) && !AlwaysReturns(body))
         {
@@ -65,14 +90,34 @@ internal sealed partial class Binder
                 $"脚本必须返回 {TypeResolver.Display(_returnType)}，但存在没有 return 的执行路径。");
         }
 
-        for (var i = 0; i < _locals.Count; i++) _locals[i].Slot = i;
+        AssignSlots(_locals);
+        foreach (var lambda in _lambdas) AssignSlots(lambda.Locals);
 
         return new BoundScript(
             body,
             _returnType,
             _locals,
             _isAsync,
-            _limits.NeedsCheckpoints);
+            _limits.NeedsCheckpoints,
+            _rootScope,
+            _lambdas);
+    }
+
+    /// <summary>Captured variables live in a closure, so only the rest need an IL local slot.</summary>
+    private static void AssignSlots(IReadOnlyList<LocalSymbol> locals)
+    {
+        var slot = 0;
+        foreach (var local in locals)
+            if (!local.IsCaptured)
+                local.Slot = slot++;
+    }
+
+    /// <summary>Records a new variable against the function and scope currently being bound.</summary>
+    private void Register(LocalSymbol local)
+    {
+        local.FunctionDepth = _functionDepth;
+        local.DeclaringScope = _closureScope;
+        _locals.Add(local);
     }
 
     /// <summary>
@@ -116,15 +161,35 @@ internal sealed partial class Binder
         _ => new BoundNop(syntax.Position),
     };
 
+    private readonly record struct ScopeState(Scope Scope, ClosureScope Closure);
+
+    /// <summary>
+    /// Enters a nested lexical scope. Every scope gets a closure object, but only the ones that
+    /// actually capture something are instantiated at run time.
+    /// </summary>
+    private ScopeState PushScope()
+    {
+        var saved = new ScopeState(_scope, _closureScope);
+        _scope = new Scope(saved.Scope);
+        _closureScope = new ClosureScope(saved.Closure);
+        return saved;
+    }
+
+    private void PopScope(ScopeState saved)
+    {
+        _scope = saved.Scope;
+        _closureScope = saved.Closure;
+    }
+
     private BoundStatement BindBlock(BlockStatementSyntax syntax)
     {
-        var saved = _scope;
-        _scope = new Scope(saved);
+        var saved = PushScope();
+        var closure = _closureScope;
 
         var statements = syntax.Statements.Select(BindStatement).ToArray();
 
-        _scope = saved;
-        return new BoundBlock(syntax.Position, statements);
+        PopScope(saved);
+        return new BoundBlock(syntax.Position, statements, closure.IsMaterialized ? closure : null);
     }
 
     private BoundStatement BindExpressionStatement(ExpressionStatementSyntax syntax)
@@ -159,7 +224,14 @@ internal sealed partial class Binder
 
             if (declaredType is null)
             {
-                if (initializer.Type == Conversions.NullLiteralType || initializer.Type == typeof(void))
+                if (initializer.Type == Conversions.LambdaType)
+                {
+                    _diagnostics.Report(ErrorCode.CannotInferType, syntax.Position,
+                        $"无法从 lambda 推断 'var {syntax.Name}' 的类型。请写出委托类型，" +
+                        $"例如 Func<int, int> {syntax.Name} = ...。");
+                    declaredType = typeof(object);
+                }
+                else if (initializer.Type == Conversions.NullLiteralType || initializer.Type == typeof(void))
                 {
                     _diagnostics.Report(ErrorCode.CannotInferType, syntax.Position,
                         $"无法从初始值推断 'var {syntax.Name}' 的类型。");
@@ -202,7 +274,7 @@ internal sealed partial class Binder
             return false;
         }
 
-        _locals.Add(local);
+        Register(local);
         return true;
     }
 
@@ -234,8 +306,8 @@ internal sealed partial class Binder
 
     private BoundStatement BindFor(ForStatementSyntax syntax)
     {
-        var saved = _scope;
-        _scope = new Scope(saved);
+        var saved = PushScope();
+        var closure = _closureScope;
 
         var initializers = syntax.Initializers.Select(BindStatement).ToArray();
         var condition = syntax.Condition is null ? null : BindCondition(syntax.Condition);
@@ -255,8 +327,9 @@ internal sealed partial class Binder
         var body = BindStatement(syntax.Body);
         _loopDepth--;
 
-        _scope = saved;
-        return new BoundFor(syntax.Position, initializers, condition, incrementors, body);
+        PopScope(saved);
+        return new BoundFor(syntax.Position, initializers, condition, incrementors, body,
+            closure.IsMaterialized ? closure : null);
     }
 
     private BoundStatement BindReturn(ReturnStatementSyntax syntax)
@@ -340,8 +413,8 @@ internal sealed partial class Binder
                 exceptionType = typeof(Exception);
             }
 
-            var saved = _scope;
-            _scope = new Scope(saved);
+            var saved = PushScope();
+            var clauseClosure = _closureScope;
 
             LocalSymbol? variable = null;
             if (clause.VariableName is not null)
@@ -354,7 +427,11 @@ internal sealed partial class Binder
             var clauseBody = BindStatement(clause.Body);
             _handlerDepth--;
 
-            _scope = saved;
+            PopScope(saved);
+
+            if (clauseClosure.IsMaterialized)
+                clauseBody = new BoundBlock(clause.Position, [clauseBody], clauseClosure);
+
             catches.Add(new BoundCatchClause(clause.Position, exceptionType, variable, clauseBody));
         }
 
@@ -394,13 +471,11 @@ internal sealed partial class Binder
         var elementType = collection.Type.GetElementType()!;
         var declaredType = ResolveElementType(syntax, elementType);
 
-        var saved = _scope;
-        _scope = new Scope(saved);
+        var saved = PushScope();
+        var loopClosure = _closureScope;
 
         var arrayLocal = MakeTemp(collection.Type);
         var indexLocal = MakeTemp(typeof(int));
-        var item = new LocalSymbol(syntax.Name, declaredType);
-        DeclareLocal(item, syntax.Position);
 
         var pos = syntax.Position;
 
@@ -432,18 +507,29 @@ internal sealed partial class Binder
             new BoundLocalAccess(pos, arrayLocal),
             new BoundLocalAccess(pos, indexLocal));
 
+        // The iteration variable belongs to a scope entered once per iteration, so capturing it
+        // in a lambda gives a fresh value each time round, as C# has done since version 5.
+        var bodySaved = PushScope();
+        var bodyClosure = _closureScope;
+
+        var item = new LocalSymbol(syntax.Name, declaredType);
+        DeclareLocal(item, syntax.Position);
+
         _loopDepth++;
         var innerBody = BindStatement(syntax.Body);
         _loopDepth--;
+
+        PopScope(bodySaved);
 
         var body = new BoundBlock(pos,
         [
             new BoundLocalDeclaration(pos, item, Convert(element, declaredType, pos, explicitCast: true)),
             innerBody,
-        ]);
+        ], bodyClosure.IsMaterialized ? bodyClosure : null);
 
-        _scope = saved;
-        return new BoundFor(pos, initializers, condition, incrementors, body);
+        PopScope(saved);
+        return new BoundFor(pos, initializers, condition, incrementors, body,
+            loopClosure.IsMaterialized ? loopClosure : null);
     }
 
     private BoundStatement BindForEachOverEnumerable(ForEachStatementSyntax syntax, BoundExpression collection)
@@ -472,31 +558,37 @@ internal sealed partial class Binder
         var elementType = currentProperty.PropertyType;
         var declaredType = ResolveElementType(syntax, elementType);
 
-        var saved = _scope;
-        _scope = new Scope(saved);
+        var saved = PushScope();
+        var loopClosure = _closureScope;
 
         var enumeratorLocal = MakeTemp(enumeratorType);
+        var current = new BoundPropertyAccess(pos, new BoundLocalAccess(pos, enumeratorLocal), currentProperty);
+
+        // Fresh scope per iteration, so a captured iteration variable is not shared.
+        var bodySaved = PushScope();
+        var bodyClosure = _closureScope;
+
         var item = new LocalSymbol(syntax.Name, declaredType);
         DeclareLocal(item, pos);
-
-        var current = new BoundPropertyAccess(pos, new BoundLocalAccess(pos, enumeratorLocal), currentProperty);
 
         _loopDepth++;
         var innerBody = BindStatement(syntax.Body);
         _loopDepth--;
 
+        PopScope(bodySaved);
+
         var loopBody = new BoundBlock(pos,
         [
             new BoundLocalDeclaration(pos, item, Convert(current, declaredType, pos, explicitCast: true)),
             innerBody,
-        ]);
+        ], bodyClosure.IsMaterialized ? bodyClosure : null);
 
         var condition = new BoundCall(pos, new BoundLocalAccess(pos, enumeratorLocal), moveNext, []);
         var loop = new BoundWhile(pos, condition, loopBody);
 
         var disposal = BuildEnumeratorDisposal(pos, enumeratorLocal);
 
-        _scope = saved;
+        PopScope(saved);
 
         BoundStatement inner = disposal is null
             ? loop
@@ -507,7 +599,7 @@ internal sealed partial class Binder
             new BoundLocalDeclaration(pos, enumeratorLocal,
                 new BoundCall(pos, collection, getEnumerator, [])),
             inner,
-        ]);
+        ], loopClosure.IsMaterialized ? loopClosure : null);
     }
 
     private BoundStatement? BuildEnumeratorDisposal(SourcePosition pos, LocalSymbol enumerator)

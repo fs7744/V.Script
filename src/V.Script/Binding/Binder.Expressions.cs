@@ -62,14 +62,103 @@ internal sealed partial class Binder
         AsExpressionSyntax asExpression => BindAs(asExpression),
         TypeofExpressionSyntax typeofExpression => BindTypeof(typeofExpression),
         ObjectCreationExpressionSyntax creation => BindObjectCreation(creation),
-        LambdaExpressionSyntax lambda => ReportLambda(lambda),
+        LambdaExpressionSyntax lambda => new BoundUnboundLambda(lambda.Position, lambda),
         ErrorExpressionSyntax => new BoundErrorExpression(syntax.Position),
         _ => Fail(syntax.Position, ErrorCode.ConstructNotSupported, "不支持的表达式。"),
     };
 
-    private BoundExpression ReportLambda(LambdaExpressionSyntax syntax) =>
-        Fail(syntax.Position, ErrorCode.LambdaNotSupported,
-            "当前版本尚不支持 lambda 表达式与闭包。请在宿主侧预先计算后通过 globals 传入。");
+    /// <summary>
+    /// Binds a lambda now that a target delegate type is known. The body is bound in its own
+    /// function frame, so any reference it makes to an enclosing variable captures that variable.
+    /// </summary>
+    internal BoundExpression BindLambda(LambdaExpressionSyntax syntax, Type delegateType)
+    {
+        var invoke = Conversions.GetInvokeMethod(delegateType);
+        if (invoke is null)
+        {
+            return Fail(syntax.Position, ErrorCode.CannotConvert,
+                $"lambda 只能转换为委托类型，{TypeResolver.Display(delegateType)} 不是委托。");
+        }
+
+        var parameters = invoke.GetParameters();
+
+        if (parameters.Length != syntax.Parameters.Count)
+        {
+            return Fail(syntax.Position, ErrorCode.WrongArgumentCount,
+                $"lambda 有 {syntax.Parameters.Count} 个参数，但 " +
+                $"{TypeResolver.Display(delegateType)} 需要 {parameters.Length} 个。");
+        }
+
+        if (parameters.Any(p => p.ParameterType.IsByRef))
+        {
+            return Fail(syntax.Position, ErrorCode.ConstructNotSupported,
+                "不支持带 ref / out 参数的委托。");
+        }
+
+        if (syntax.Body is not ExpressionSyntax bodyExpression)
+        {
+            return Fail(syntax.Position, ErrorCode.LambdaBodyNotSupported,
+                "只支持表达式形式的 lambda（x => 表达式）。带语句块的 lambda 尚不支持，" +
+                "因为块体可以包含循环，而 lambda 方法内没有注入执行预算检查点。");
+        }
+
+        var savedScope = _scope;
+        var savedClosure = _closureScope;
+        var savedLocals = _locals;
+        var savedLoopDepth = _loopDepth;
+        var savedHandlerDepth = _handlerDepth;
+
+        _functionDepth++;
+        _scope = new Scope(savedScope);
+        _closureScope = new ClosureScope(savedClosure);
+        _locals = [];
+        _loopDepth = 0;
+        _handlerDepth = 0;
+
+        var ownScope = _closureScope;
+        var lambdaParameters = new List<LocalSymbol>(parameters.Length);
+
+        for (var i = 0; i < parameters.Length; i++)
+        {
+            // Argument 0 of the generated lambda method is always its closure.
+            var parameter = new LocalSymbol(syntax.Parameters[i], parameters[i].ParameterType)
+            {
+                LambdaArgIndex = i + 1,
+            };
+
+            Register(parameter);
+
+            if (!_scope.TryDeclare(parameter))
+            {
+                _diagnostics.Report(ErrorCode.VariableAlreadyDefined, syntax.Position,
+                    $"lambda 参数 '{parameter.Name}' 重复。");
+            }
+
+            lambdaParameters.Add(parameter);
+        }
+
+        var body = BindExpression(bodyExpression);
+        var returnType = invoke.ReturnType;
+
+        if (returnType != typeof(void))
+            body = Convert(body, returnType, syntax.Position, explicitCast: false);
+
+        var lambdaLocals = _locals;
+
+        _functionDepth--;
+        _scope = savedScope;
+        _closureScope = savedClosure;
+        _locals = savedLocals;
+        _loopDepth = savedLoopDepth;
+        _handlerDepth = savedHandlerDepth;
+
+        var lambda = new BoundLambda(
+            syntax.Position, delegateType, lambdaParameters, lambdaLocals,
+            body, returnType, ownScope, savedClosure);
+
+        _lambdas.Add(lambda);
+        return lambda;
+    }
 
     private BoundExpression Fail(SourcePosition position, ErrorCode code, string message)
     {
@@ -194,13 +283,7 @@ internal sealed partial class Binder
     private BoundExpression BindName(NameExpressionSyntax syntax)
     {
         if (_scope.TryLookup(syntax.Name, out var local))
-            return new BoundLocalAccess(syntax.Position, local);
-
-        foreach (var parameter in _parameters)
-        {
-            if (parameter.IsGlobals || parameter.Name != syntax.Name) continue;
-            return new BoundParameterAccess(syntax.Position, parameter.Type, parameter.IlIndex);
-        }
+            return MakeLocalAccess(syntax.Position, local);
 
         if (TryBindGlobalsMember(syntax.Position, syntax.Name, out var globalsMember))
             return globalsMember!;
@@ -211,12 +294,24 @@ internal sealed partial class Binder
         return Fail(syntax.Position, ErrorCode.UndefinedName, $"找不到名称 '{syntax.Name}'。");
     }
 
+    /// <summary>
+    /// Reads a variable. Reaching one that belongs to an enclosing function is exactly what
+    /// capture means, so the variable is moved into its declaring scope's closure.
+    /// </summary>
+    private BoundExpression MakeLocalAccess(SourcePosition position, LocalSymbol local)
+    {
+        if (local.FunctionDepth < _functionDepth)
+            local.DeclaringScope!.Capture(local);
+
+        return new BoundLocalAccess(position, local);
+    }
+
     private bool TryBindGlobalsMember(SourcePosition position, string name, out BoundExpression? result)
     {
         result = null;
-        if (_globals is null) return false;
+        if (_globals is null || _globalsLocal is null) return false;
 
-        var receiver = new BoundParameterAccess(position, _globals.Type, _globals.IlIndex);
+        var receiver = MakeLocalAccess(position, _globalsLocal);
 
         var property = _globals.Type.GetProperty(name, InstanceFlags);
         if (property is not null && property.CanRead)
@@ -350,6 +445,11 @@ internal sealed partial class Binder
 
         switch (syntax.Target)
         {
+            case NameExpressionSyntax delegateName
+                when _scope.TryLookup(delegateName.Name, out var delegateLocal) &&
+                     Conversions.IsDelegateType(delegateLocal.Type):
+                return BindDelegateInvocation(syntax, MakeLocalAccess(syntax.Position, delegateLocal));
+
             case MemberAccessExpressionSyntax member:
             {
                 var target = BindExpression(member.Target);
@@ -369,27 +469,40 @@ internal sealed partial class Binder
                 break;
             }
 
-            case NameExpressionSyntax name when _globals is not null:
+            case NameExpressionSyntax name when _globalsLocal is not null:
             {
-                receiver = new BoundParameterAccess(syntax.Position, _globals.Type, _globals.IlIndex);
-                lookupType = _globals.Type;
+                receiver = MakeLocalAccess(syntax.Position, _globalsLocal);
+                lookupType = _globals!.Type;
                 methodName = name.Name;
                 break;
             }
 
             default:
-                return Fail(syntax.Position, ErrorCode.NotInvocable, "该表达式不可调用。");
+            {
+                // Anything that evaluates to a delegate can be invoked: a chained call such as
+                // f(1)(2), an indexer result, a property, and so on.
+                var value = BindExpression(syntax.Target);
+                if (value is BoundErrorExpression) return value;
+
+                if (Conversions.IsDelegateType(value.Type))
+                    return BindDelegateInvocation(syntax, value);
+
+                return Fail(syntax.Position, ErrorCode.NotInvocable,
+                    $"{TypeResolver.Display(value.Type)} 不可调用。");
+            }
         }
 
         var methods = GatherMethods(lookupType, methodName, staticOnly);
-        if (methods.Count == 0)
+
+        var extensions = staticOnly || receiver is null
+            ? []
+            : _resolver.GetExtensionMethods(methodName);
+
+        if (methods.Count == 0 && extensions.Count == 0)
         {
-            if (!staticOnly && _resolver.HasExtensionMethodCandidate(lookupType, methodName))
-            {
-                return Fail(syntax.Position, ErrorCode.ExtensionMethodNotSupported,
-                    $"'{methodName}' 只能作为扩展方法调用，当前版本尚不支持扩展方法（LINQ 亦在此列）。" +
-                    "请在宿主侧计算后通过 globals 传入结果。");
-            }
+            // A member holding a delegate is invoked rather than called.
+            if (TryFindDelegateMember(lookupType, methodName, receiver, syntax.Position) is { } delegateMember)
+                return BindDelegateInvocation(syntax, delegateMember);
 
             return Fail(syntax.Position, ErrorCode.UndefinedMember,
                 $"{TypeResolver.Display(lookupType)} 不包含名为 '{methodName}' 的方法。{Suggest(lookupType, methodName)}");
@@ -402,11 +515,20 @@ internal sealed partial class Binder
         if (arguments.Any(a => a.Bound is BoundErrorExpression))
             return new BoundErrorExpression(syntax.Position);
 
-        var infos = arguments
-            .Select(a => new ArgumentInfo(a.Bound.Type, a.Argument.Name))
-            .ToArray();
+        var bound = arguments.Select(a => a.Bound).ToArray();
+        var infos = arguments.Select(a => Describe(a.Bound, a.Argument.Name)).ToArray();
 
-        var resolution = OverloadResolution.Resolve(methods, infos);
+        var resolution = methods.Count > 0
+            ? OverloadResolution.Resolve(methods, infos, (i, types) => ProbeLambdaReturn(bound, i, types))
+            : new OverloadResult(OverloadOutcome.NoneApplicable, null, methods);
+
+        // An extension method is only considered when no ordinary member fits, which is the
+        // order C# uses too.
+        if (resolution.Outcome != OverloadOutcome.Resolved && extensions.Count > 0 && receiver is not null)
+        {
+            var extended = BindAsExtensionCall(syntax, methodName, receiver, bound, infos, extensions);
+            if (extended is not null) return extended;
+        }
 
         switch (resolution.Outcome)
         {
@@ -418,11 +540,11 @@ internal sealed partial class Binder
                     $"对 '{methodName}' 的调用不明确，存在多个同样匹配的重载。");
 
             default:
-                if (resolution.SkippedGenericCandidates)
+                if (resolution.SkippedGenericCandidates || extensions.Count > 0)
                 {
                     return Fail(syntax.Position, ErrorCode.GenericMethodInferenceNotSupported,
-                        $"'{methodName}' 是泛型方法，需要类型参数推断，当前版本尚不支持。" +
-                        "请在宿主侧调用后通过 globals 传入结果。");
+                        $"无法确定 '{methodName}' 的类型参数。请检查实参类型，" +
+                        "或写出显式类型（引擎不支持从方法组推断）。");
                 }
 
                 return Fail(syntax.Position, ErrorCode.NoMatchingOverload,
@@ -448,6 +570,145 @@ internal sealed partial class Binder
 
         var finalArguments = BuildArguments(best, arguments.Select(a => a.Bound).ToArray(), syntax.Position);
         return new BoundCall(syntax.Position, method.IsStatic ? null : receiver, method, finalArguments);
+    }
+
+    /// <summary>
+    /// Presents an argument to overload resolution. A lambda has no type yet, so it is described
+    /// by its parameter count and matched against delegate-typed parameters.
+    /// </summary>
+    private static ArgumentInfo Describe(BoundExpression argument, string? name) =>
+        argument is BoundUnboundLambda unbound
+            ? new ArgumentInfo(Conversions.LambdaType, name, unbound.Syntax.Parameters.Count)
+            : new ArgumentInfo(argument.Type, name);
+
+    private BoundExpression? TryFindDelegateMember(
+        Type lookupType,
+        string name,
+        BoundExpression? receiver,
+        SourcePosition position)
+    {
+        var property = lookupType.GetProperty(name, receiver is null ? StaticFlags : InstanceFlags);
+        if (property is not null && property.CanRead && Conversions.IsDelegateType(property.PropertyType))
+            return new BoundPropertyAccess(position, receiver, property);
+
+        var field = lookupType.GetField(name, receiver is null ? StaticFlags : InstanceFlags);
+        if (field is not null && Conversions.IsDelegateType(field.FieldType))
+            return new BoundFieldAccess(position, field.IsStatic ? null : receiver, field);
+
+        return null;
+    }
+
+    private BoundExpression BindDelegateInvocation(InvocationExpressionSyntax syntax, BoundExpression target)
+    {
+        var invoke = Conversions.GetInvokeMethod(target.Type)!;
+        var parameters = invoke.GetParameters();
+
+        if (syntax.Arguments.Count != parameters.Length)
+        {
+            return Fail(syntax.Position, ErrorCode.WrongArgumentCount,
+                $"{TypeResolver.Display(target.Type)} 需要 {parameters.Length} 个参数，" +
+                $"实际提供了 {syntax.Arguments.Count} 个。");
+        }
+
+        var arguments = new BoundExpression[parameters.Length];
+        for (var i = 0; i < parameters.Length; i++)
+        {
+            var bound = BindExpression(syntax.Arguments[i].Value);
+            if (bound is BoundErrorExpression) return bound;
+            arguments[i] = Convert(bound, parameters[i].ParameterType, syntax.Position, explicitCast: false);
+        }
+
+        return new BoundDelegateInvoke(syntax.Position, invoke.ReturnType, target, invoke, arguments);
+    }
+
+    /// <summary>
+    /// Re-runs resolution with the receiver moved into first position, which is exactly what an
+    /// extension method call is. Returns null when no extension applies either.
+    /// </summary>
+    private BoundExpression? BindAsExtensionCall(
+        InvocationExpressionSyntax syntax,
+        string methodName,
+        BoundExpression receiver,
+        IReadOnlyList<BoundExpression> bound,
+        IReadOnlyList<ArgumentInfo> infos,
+        IReadOnlyList<MethodInfo> extensions)
+    {
+        var extendedInfos = new ArgumentInfo[infos.Count + 1];
+        extendedInfos[0] = new ArgumentInfo(receiver.Type, null);
+        for (var i = 0; i < infos.Count; i++) extendedInfos[i + 1] = infos[i];
+
+        var extendedBound = new List<BoundExpression>(bound.Count + 1) { receiver };
+        extendedBound.AddRange(bound);
+
+        var candidates = extensions.Cast<MethodBase>().ToArray();
+
+        // Argument 0 is the receiver, so a lambda probe index has to shift back by one.
+        var resolution = OverloadResolution.Resolve(
+            candidates, extendedInfos, (i, types) => ProbeLambdaReturn(bound, i - 1, types));
+
+        if (resolution.Outcome != OverloadOutcome.Resolved) return null;
+
+        var method = (MethodInfo)resolution.Best!.Method;
+        var finalArguments = BuildArguments(resolution.Best!, extendedBound, syntax.Position);
+
+        _ = methodName;
+        return new BoundCall(syntax.Position, null, method, finalArguments);
+    }
+
+    /// <summary>
+    /// Binds a lambda argument's body speculatively so that generic inference can learn its
+    /// return type. Diagnostics and any lambdas it creates are discarded; only the type escapes.
+    /// </summary>
+    private Type? ProbeLambdaReturn(IReadOnlyList<BoundExpression> bound, int index, Type[] parameterTypes)
+    {
+        if (index < 0 || index >= bound.Count) return null;
+        if (bound[index] is not BoundUnboundLambda unbound) return null;
+        if (unbound.Syntax.Body is not ExpressionSyntax body) return null;
+        if (unbound.Syntax.Parameters.Count != parameterTypes.Length) return null;
+
+        var savedDiagnostics = _diagnostics;
+        var savedScope = _scope;
+        var savedClosure = _closureScope;
+        var savedLocals = _locals;
+        var savedFunctionDepth = _functionDepth;
+        var lambdaCount = _lambdas.Count;
+
+        _diagnostics = new DiagnosticBag();
+        _functionDepth++;
+        _scope = new Scope(savedScope);
+        _closureScope = new ClosureScope(savedClosure);
+        _locals = [];
+
+        try
+        {
+            for (var i = 0; i < parameterTypes.Length; i++)
+            {
+                var parameter = new LocalSymbol(unbound.Syntax.Parameters[i], parameterTypes[i])
+                {
+                    LambdaArgIndex = i + 1,
+                };
+
+                Register(parameter);
+                _scope.TryDeclare(parameter);
+            }
+
+            var result = BindExpression(body);
+
+            if (_diagnostics.HasErrors || result is BoundErrorExpression) return null;
+            if (result.Type == typeof(void) || result.Type == Conversions.LambdaType) return null;
+            if (result.Type == Conversions.NullLiteralType) return null;
+
+            return result.Type;
+        }
+        finally
+        {
+            _diagnostics = savedDiagnostics;
+            _scope = savedScope;
+            _closureScope = savedClosure;
+            _locals = savedLocals;
+            _functionDepth = savedFunctionDepth;
+            _lambdas.RemoveRange(lambdaCount, _lambdas.Count - lambdaCount);
+        }
     }
 
     private static string DescribeCandidates(IReadOnlyList<MethodBase> methods) =>
@@ -659,7 +920,7 @@ internal sealed partial class Binder
             .Cast<MethodBase>()
             .ToArray();
 
-        var infos = arguments.Select(a => new ArgumentInfo(a.Bound.Type, a.Argument.Name)).ToArray();
+        var infos = arguments.Select(a => Describe(a.Bound, a.Argument.Name)).ToArray();
         var resolution = OverloadResolution.Resolve(constructors, infos);
 
         if (resolution.Outcome != OverloadOutcome.Resolved)
@@ -723,6 +984,12 @@ internal sealed partial class Binder
         {
             return Fail(syntax.Position, ErrorCode.AwaitInSynchronousScript,
                 "同步脚本中不能使用 'await'。请改用 CompileAsync 编译。");
+        }
+
+        if (_functionDepth > 0)
+        {
+            return Fail(syntax.Position, ErrorCode.AwaitInLambda,
+                "lambda 内不能使用 'await'。lambda 被编译为独立的同步方法，无法承载挂起点。");
         }
 
         if (_handlerDepth > 0)

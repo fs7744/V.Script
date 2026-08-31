@@ -39,7 +39,6 @@ public enum ErrorCode
     NotInvocable = 2011,
     NotIndexable = 2012,
     NotEnumerable = 2013,
-    UseOfUnassignedVariable = 2014,
     WrongArgumentCount = 2015,
     ReturnTypeMismatch = 2016,
     CannotInferType = 2017,
@@ -49,7 +48,6 @@ public enum ErrorCode
     MemberIsStatic = 2021,
     PropertyHasNoGetter = 2022,
     PropertyHasNoSetter = 2023,
-    DivisionByConstantZero = 2024,
 
     // ---- 3xxx async / control flow ----
     AwaitInSynchronousScript = 3001,
@@ -57,13 +55,11 @@ public enum ErrorCode
     ContinueOutsideLoop = 3003,
     AwaitInExceptionHandler = 3004,
     NotAllCodePathsReturn = 3005,
-    UnreachableCode = 3006,
 
     // ---- 9xxx not implemented ----
-    LambdaNotSupported = 9001,
     GenericMethodInferenceNotSupported = 9002,
-    ExtensionMethodNotSupported = 9003,
-    PatternMatchingNotSupported = 9004,
+    LambdaBodyNotSupported = 9005,
+    AwaitInLambda = 9006,
     ConstructNotSupported = 9010,
 }
 

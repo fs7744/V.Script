@@ -295,12 +295,6 @@ public sealed class DiagnosticsTests : ScriptTest
     }
 
     [Fact]
-    public void Unsupported_lambda_gets_a_dedicated_code()
-    {
-        AssertError<OrderGlobals, int>("Calc.Sum(x => x)", ErrorCode.LambdaNotSupported);
-    }
-
-    [Fact]
     public void Unknown_type_names_are_reported()
     {
         AssertErrorIn("NoSuchType x = null; return 0;", ErrorCode.UnknownType);
@@ -322,25 +316,9 @@ public sealed class DiagnosticsTests : ScriptTest
 public sealed class UnsupportedConstructTests : ScriptTest
 {
     [Fact]
-    public void Lambda_reports_its_own_code()
+    public void Inference_with_nothing_to_infer_from_is_named_as_such()
     {
-        AssertError<OrderGlobals, int>("Calc.Sum(x => x)", ErrorCode.LambdaNotSupported);
-    }
-
-    [Fact]
-    public void Linq_extension_method_is_named_as_such()
-    {
-        var diagnostics = Errors<OrderGlobals, int>("Numbers.Count()");
-        var reported = diagnostics.Single(d => d.Severity == DiagnosticSeverity.Error);
-
-        Assert.Equal(ErrorCode.ExtensionMethodNotSupported, reported.Id);
-        Assert.Contains("扩展方法", reported.Message);
-    }
-
-    [Fact]
-    public void Generic_method_needing_inference_is_named_as_such()
-    {
-        // Array.Empty<T>() is generic and has no argument to infer from.
+        // Array.Empty<T>() has no argument that could fix T.
         AssertError<OrderGlobals, int>("Array.Empty().Length", ErrorCode.GenericMethodInferenceNotSupported);
     }
 

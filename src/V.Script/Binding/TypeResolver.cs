@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Collections.Frozen;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using V.Script.Syntax;
 
 namespace V.Script.Binding;
@@ -35,11 +36,14 @@ public sealed class TypeResolver
     private readonly IReadOnlyList<Assembly> _references;
     private readonly IReadOnlyList<string> _imports;
     private readonly ConcurrentDictionary<string, Type?> _cache = new(StringComparer.Ordinal);
+    private readonly Lazy<FrozenDictionary<string, MethodInfo[]>> _extensionMethods;
 
     public TypeResolver(IReadOnlyList<Assembly> references, IReadOnlyList<string> imports)
     {
         _references = references;
         _imports = imports;
+        _extensionMethods = new Lazy<FrozenDictionary<string, MethodInfo[]>>(
+            BuildExtensionIndex, LazyThreadSafetyMode.ExecutionAndPublication);
     }
 
     /// <summary>Resolves a parsed type reference, or returns null when it cannot be found.</summary>
@@ -127,12 +131,15 @@ public sealed class TypeResolver
     }
 
     /// <summary>
-    /// Looks for extension methods named <paramref name="name"/> that could apply to
-    /// <paramref name="receiverType"/>. Only used on the error path, to turn a vague
-    /// "no such member" into an explicit "extension methods are not supported yet".
+    /// Extension methods visible through the imported namespaces, indexed by name. Built once
+    /// per engine and only on first use, because scanning the exported types of every reference
+    /// is not something an ordinary member lookup should pay for.
     /// </summary>
-    public bool HasExtensionMethodCandidate(Type receiverType, string name)
+    private FrozenDictionary<string, MethodInfo[]> BuildExtensionIndex()
     {
+        var imports = _imports.ToHashSet(StringComparer.Ordinal);
+        var byName = new Dictionary<string, List<MethodInfo>>(StringComparer.Ordinal);
+
         foreach (var assembly in _references)
         {
             Type[] types;
@@ -140,31 +147,41 @@ public sealed class TypeResolver
             {
                 types = assembly.GetExportedTypes();
             }
-            catch (Exception ex) when (ex is NotSupportedException or FileNotFoundException)
+            catch (Exception ex) when (ex is NotSupportedException or FileNotFoundException or TypeLoadException)
             {
                 continue;
             }
 
             foreach (var type in types)
             {
-                if (!type.IsSealed || !type.IsAbstract || type.IsGenericType) continue;
-                if (!_imports.Contains(type.Namespace ?? string.Empty)) continue;
+                // A static class in C# is abstract and sealed, and carries [Extension].
+                if (!type.IsAbstract || !type.IsSealed || type.IsGenericTypeDefinition) continue;
+                if (!imports.Contains(type.Namespace ?? string.Empty)) continue;
+                if (!type.IsDefined(typeof(ExtensionAttribute), inherit: false)) continue;
 
                 foreach (var method in type.GetMethods(BindingFlags.Public | BindingFlags.Static))
                 {
-                    if (method.Name != name) continue;
-                    if (!method.IsDefined(typeof(System.Runtime.CompilerServices.ExtensionAttribute), false)) continue;
+                    if (!method.IsDefined(typeof(ExtensionAttribute), inherit: false)) continue;
+                    if (method.GetParameters().Length == 0) continue;
 
-                    var parameters = method.GetParameters();
-                    if (parameters.Length == 0) continue;
+                    if (!byName.TryGetValue(method.Name, out var list))
+                        byName[method.Name] = list = [];
 
-                    if (CouldReceive(parameters[0].ParameterType, receiverType)) return true;
+                    list.Add(method);
                 }
             }
         }
 
-        return false;
+        return byName.ToFrozenDictionary(e => e.Key, e => e.Value.ToArray(), StringComparer.Ordinal);
     }
+
+    /// <summary>Extension methods with this name, in declaration order. Empty when there are none.</summary>
+    public IReadOnlyList<MethodInfo> GetExtensionMethods(string name) =>
+        _extensionMethods.Value.TryGetValue(name, out var methods) ? methods : [];
+
+    /// <summary>Whether any extension method by that name could plausibly take this receiver.</summary>
+    public bool HasExtensionMethodCandidate(Type receiverType, string name) =>
+        GetExtensionMethods(name).Any(m => CouldReceive(m.GetParameters()[0].ParameterType, receiverType));
 
     private static bool CouldReceive(Type parameterType, Type receiverType)
     {
