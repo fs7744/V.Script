@@ -260,16 +260,6 @@ public sealed record BoundSequence(
     IReadOnlyList<BoundExpression> SideEffects,
     BoundExpression Value) : BoundExpression(Position, Type);
 
-public enum IntrinsicKind
-{
-    /// <summary>The <see cref="ScriptState"/> local's cancellation token.</summary>
-    ScriptStateToken,
-}
-
-/// <summary>A value produced by the generated method's own frame rather than by script code.</summary>
-public sealed record BoundIntrinsic(SourcePosition Position, Type Type, IntrinsicKind Kind)
-    : BoundExpression(Position, Type);
-
 /// <summary>
 /// A lambda before a target type is known. C# anonymous functions have no type of their own, so
 /// this survives until overload resolution picks the parameter it converts to.
@@ -278,16 +268,21 @@ public sealed record BoundUnboundLambda(
     SourcePosition Position,
     Syntax.LambdaExpressionSyntax Syntax) : BoundExpression(Position, Conversions.LambdaType);
 
-/// <summary>A lambda bound against a concrete delegate type; the emitter gives it its own method.</summary>
+/// <summary>
+/// A lambda bound against a concrete delegate type; the emitter gives it its own method.
+/// Exactly one of <paramref name="Body"/> and <paramref name="BodyStatement"/> is set,
+/// depending on whether the source wrote an expression or a block.
+/// </summary>
 public sealed record BoundLambda(
     SourcePosition Position,
     Type Type,
     IReadOnlyList<LocalSymbol> Parameters,
     IReadOnlyList<LocalSymbol> Locals,
-    BoundExpression Body,
+    BoundExpression? Body,
     Type ReturnType,
     ClosureScope OwnScope,
-    ClosureScope? EnclosingClosure) : BoundExpression(Position, Type)
+    ClosureScope? EnclosingClosure,
+    BoundStatement? BodyStatement = null) : BoundExpression(Position, Type)
 {
     /// <summary>Index into the host's lambda table; assigned by the emitter.</summary>
     public int Index { get; internal set; } = -1;
@@ -382,6 +377,5 @@ public sealed record BoundScript(
     Type ReturnType,
     IReadOnlyList<LocalSymbol> Locals,
     bool IsAsync,
-    bool UsesCheckpoints,
     ClosureScope RootScope,
     IReadOnlyList<BoundLambda> Lambdas);

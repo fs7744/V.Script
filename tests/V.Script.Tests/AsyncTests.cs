@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using V.Script.Diagnostics;
 
 namespace V.Script.Tests;
@@ -144,7 +143,7 @@ public sealed class AsyncExecutionTests : ScriptTest
         using var script = engine.CompileAsync<AsyncGlobals, int>("await Service.GetAsync(Seed)");
 
         var tasks = Enumerable.Range(0, 50)
-            .Select(i => script.RunAsync(new AsyncGlobals { Seed = i }).AsTask())
+            .Select(i => script.RunAsync(new AsyncGlobals { Seed = i }))
             .ToArray();
 
         var results = await Task.WhenAll(tasks);
@@ -209,61 +208,5 @@ public sealed class AsyncRestrictionTests : ScriptTest
         using var engine = new ScriptEngine(Options);
         Assert.Throws<ArgumentException>(
             () => engine.CompileAsyncDelegate<Func<int, int>>("a", "a"));
-    }
-}
-
-public sealed class AsyncCancellationTests : ScriptTest
-{
-    private static readonly ScriptLimits Short = new() { Timeout = TimeSpan.FromMilliseconds(300) };
-
-    [Fact]
-    public async Task Timeout_interrupts_a_script_suspended_on_an_await()
-    {
-        // The script never reaches a loop back-edge, so only the token threaded into
-        // Task.WaitAsync can break the suspension. This is the load-bearing case for limits.
-        var stopwatch = Stopwatch.StartNew();
-
-        await Assert.ThrowsAsync<ScriptTimeoutException>(
-            () => RunAsync<AsyncGlobals, int>("await Service.NeverAsync()", new AsyncGlobals(), Short));
-
-        stopwatch.Stop();
-        Assert.True(stopwatch.ElapsedMilliseconds < 5000, $"耗时 {stopwatch.ElapsedMilliseconds} ms，未在超时后立即返回。");
-    }
-
-    [Fact]
-    public async Task Caller_cancellation_propagates_into_the_await()
-    {
-        using var cts = new CancellationTokenSource();
-        cts.CancelAfter(200);
-
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => RunAsync<AsyncGlobals, int>(
-                "await Service.NeverAsync()",
-                new AsyncGlobals(),
-                ScriptLimits.Unlimited with { Timeout = TimeSpan.FromSeconds(30) },
-                cts.Token));
-    }
-
-    [Fact]
-    public async Task Script_completing_before_the_timeout_returns_normally()
-    {
-        var result = await RunAsync<AsyncGlobals, int>(
-            "await Service.DelayedAsync(5, 10)", new AsyncGlobals(), Short);
-
-        Assert.Equal(5, result);
-    }
-
-    [Fact]
-    public async Task Timeout_applies_across_several_awaits()
-    {
-        const string source = """
-            var total = 0;
-            for (var i = 0; i < 20; i++)
-                total += await Service.DelayedAsync(1, 50);
-            return total;
-            """;
-
-        await Assert.ThrowsAsync<ScriptTimeoutException>(
-            () => RunAsync<AsyncGlobals, int>(source, new AsyncGlobals(), Short));
     }
 }

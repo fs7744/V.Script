@@ -65,6 +65,27 @@ public sealed class MemberAccessTests : ScriptTest
         Assert.Equal("a,b", Eval<string>("string.Join(\",\", \"a\", \"b\")"));
     }
 
+    /// <summary>
+    /// A namespace qualifier is not a value, so a dotted chain has to be offered to the type
+    /// resolver as a whole before its head is bound as an expression.
+    /// </summary>
+    [Fact]
+    public void Fully_qualified_names_resolve()
+    {
+        Assert.Equal(2, Eval<int>("System.Math.Max(1, 2)"));
+        Assert.Equal(1, Eval<int>("(int)System.DayOfWeek.Monday"));
+        Assert.Equal(int.MaxValue, Eval<int>("System.Int32.MaxValue"));
+        Assert.Equal(0, Eval<int>("new System.Text.StringBuilder().Length"));
+    }
+
+    [Fact]
+    public void A_globals_member_wins_over_a_type_of_the_same_name()
+    {
+        // 'Order' is both a globals property and a type; the property must win.
+        var globals = new OrderGlobals { Order = new Order { Code = "abc" } };
+        Assert.Equal("abc", Run<OrderGlobals, string>("Order.Code", globals));
+    }
+
     [Fact]
     public void Calling_a_static_member_through_an_instance_is_rejected()
     {

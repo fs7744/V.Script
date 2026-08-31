@@ -18,14 +18,14 @@ public interface ICompiledScript : IDisposable
 /// </summary>
 public sealed class Script<TGlobals, TResult> : ICompiledScript
 {
-    private readonly Func<CancellationToken, TGlobals, TResult> _invoke;
+    private readonly Func<TGlobals, TResult> _invoke;
     private readonly IDisposable? _owner;
     private readonly Action? _onDispose;
     private int _disposed;
 
     internal Script(
         string source,
-        Func<CancellationToken, TGlobals, TResult> invoke,
+        Func<TGlobals, TResult> invoke,
         IDisposable? owner,
         IReadOnlyList<Diagnostic> diagnostics,
         Action? onDispose)
@@ -41,13 +41,15 @@ public sealed class Script<TGlobals, TResult> : ICompiledScript
 
     public IReadOnlyList<Diagnostic> Diagnostics { get; }
 
-    /// <summary>Runs the script. Throws <see cref="ScriptTimeoutException"/> or
-    /// <see cref="ScriptBudgetExceededException"/> when a configured limit is hit.</summary>
-    public TResult Run(TGlobals globals, CancellationToken cancellationToken = default)
+    /// <summary>Runs the script. This is a direct delegate call — nothing is wrapped around it.</summary>
+    public TResult Run(TGlobals globals)
     {
         ObjectDisposedException.ThrowIf(_disposed != 0, this);
-        return _invoke(cancellationToken, globals);
+        return _invoke(globals);
     }
+
+    /// <summary>The compiled delegate itself, for callers that want to skip even the disposed check.</summary>
+    public Func<TGlobals, TResult> Delegate => _invoke;
 
     public void Dispose()
     {
@@ -61,27 +63,31 @@ public sealed class Script<TGlobals, TResult> : ICompiledScript
 /// A compiled asynchronous script. Its code lives in a dedicated collectible assembly, so
 /// disposing this instance releases that one script's memory without affecting the others.
 /// </summary>
+/// <remarks>
+/// <see cref="RunAsync"/> hands back the generated method's own <see cref="Task{TResult}"/>
+/// unchanged. There is no wrapper state machine and no per-invocation timer, which is what keeps
+/// an asynchronous call as cheap as a synchronous one. Cancellation belongs to the host: put a
+/// <see cref="CancellationToken"/> on the globals object and let the script pass it to whatever
+/// it awaits.
+/// </remarks>
 public sealed class AsyncScript<TGlobals, TResult> : ICompiledScript
 {
-    private readonly Func<CancellationToken, TGlobals, Task<TResult>> _invoke;
+    private readonly Func<TGlobals, Task<TResult>> _invoke;
     private readonly IDisposable? _owner;
     private readonly Action? _onDispose;
-    private readonly ScriptLimits _limits;
     private int _disposed;
 
     internal AsyncScript(
         string source,
-        Func<CancellationToken, TGlobals, Task<TResult>> invoke,
+        Func<TGlobals, Task<TResult>> invoke,
         IDisposable? owner,
         IReadOnlyList<Diagnostic> diagnostics,
-        ScriptLimits limits,
         Action? onDispose)
     {
         Source = source;
         _invoke = invoke;
         _owner = owner;
         Diagnostics = diagnostics;
-        _limits = limits;
         _onDispose = onDispose;
     }
 
@@ -89,34 +95,15 @@ public sealed class AsyncScript<TGlobals, TResult> : ICompiledScript
 
     public IReadOnlyList<Diagnostic> Diagnostics { get; }
 
-    /// <summary>
-    /// Runs the script. A configured timeout is enforced by cancelling the token the script
-    /// threads into every <c>await</c>, so a suspended script is interrupted rather than
-    /// waiting forever for a checkpoint it will never reach.
-    /// </summary>
-    public async ValueTask<TResult> RunAsync(TGlobals globals, CancellationToken cancellationToken = default)
+    /// <summary>Runs the script and returns its task directly.</summary>
+    public Task<TResult> RunAsync(TGlobals globals)
     {
         ObjectDisposedException.ThrowIf(_disposed != 0, this);
-
-        if (_limits.Timeout is not { } timeout)
-            return await _invoke(cancellationToken, globals).ConfigureAwait(false);
-
-        // Linking is only needed when the caller actually supplied a cancellable token;
-        // a plain timer source is measurably cheaper for the common default(CancellationToken).
-        using var timer = cancellationToken.CanBeCanceled
-            ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
-            : new CancellationTokenSource();
-        timer.CancelAfter(timeout);
-
-        try
-        {
-            return await _invoke(timer.Token, globals).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            throw new ScriptTimeoutException(timeout);
-        }
+        return _invoke(globals);
     }
+
+    /// <summary>The compiled delegate itself, for callers that want to skip even the disposed check.</summary>
+    public Func<TGlobals, Task<TResult>> Delegate => _invoke;
 
     public void Dispose()
     {

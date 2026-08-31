@@ -11,11 +11,9 @@ namespace V.Script.Benchmarks;
 public class ExecutionBenchmarks
 {
     private ScriptEngine _engine = null!;
-    private ScriptEngine _limitedEngine = null!;
     private Script<PricingContext, decimal> _pricing = null!;
     private Script<PricingContext, bool> _rule = null!;
     private Script<LoopContext, int> _loop = null!;
-    private Script<LoopContext, int> _loopWithLimits = null!;
 
     private PricingContext _pricingContext = null!;
     private LoopContext _loopContext = null!;
@@ -36,15 +34,11 @@ public class ExecutionBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        _engine = new ScriptEngine(ScriptOptions.Default.WithLimits(ScriptLimits.Unlimited));
+        _engine = new ScriptEngine();
 
         _pricing = _engine.Compile<PricingContext, decimal>(PricingSource);
         _rule = _engine.Compile<PricingContext, bool>(RuleSource);
         _loop = _engine.Compile<LoopContext, int>(LoopSource);
-
-        _limitedEngine = new ScriptEngine(ScriptOptions.Default
-            .WithLimits(new ScriptLimits { MaxSteps = long.MaxValue, Timeout = TimeSpan.FromHours(1) }));
-        _loopWithLimits = _limitedEngine.Compile<LoopContext, int>(LoopSource);
 
         _pricingContext = new PricingContext
         {
@@ -60,11 +54,7 @@ public class ExecutionBenchmarks
     }
 
     [GlobalCleanup]
-    public void Cleanup()
-    {
-        _engine.Dispose();
-        _limitedEngine.Dispose();
-    }
+    public void Cleanup() => _engine.Dispose();
 
     // ---------------------------------------------------------------- formula
 
@@ -90,6 +80,7 @@ public class ExecutionBenchmarks
     [Benchmark(Description = "rule / script")]
     public bool RuleScript() => _rule.Run(_pricingContext);
 
+
     // ---------------------------------------------------------------- loop
 
     [Benchmark(Description = "loop x1000 / hand-written C#")]
@@ -104,7 +95,4 @@ public class ExecutionBenchmarks
     [Benchmark(Description = "loop x1000 / script, no limits")]
     public int LoopScript() => _loop.Run(_loopContext);
 
-    /// <summary>Isolates the cost of the checkpoint injected at each loop back-edge.</summary>
-    [Benchmark(Description = "loop x1000 / script, limits on")]
-    public int LoopScriptWithLimits() => _loopWithLimits.Run(_loopContext);
 }

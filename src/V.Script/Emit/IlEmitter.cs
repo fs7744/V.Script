@@ -1,4 +1,3 @@
-using System.Reflection;
 using System.Reflection.Emit;
 using V.Script.Binding;
 
@@ -19,7 +18,6 @@ internal sealed partial class IlEmitter
 {
     private readonly ILGenerator _il;
     private readonly BoundScript _script;
-    private readonly bool _hasCancellationToken;
 
     /// <summary>Set when emitting a lambda body rather than the script body.</summary>
     private readonly BoundLambda? _lambda;
@@ -30,7 +28,6 @@ internal sealed partial class IlEmitter
     private readonly Dictionary<LocalSymbol, LocalBuilder> _locals = [];
     private readonly Dictionary<ClosureScope, LocalBuilder> _closures = [];
 
-    private LocalBuilder? _state;
     private LocalBuilder? _returnValue;
     private Label _returnLabel;
 
@@ -39,13 +36,11 @@ internal sealed partial class IlEmitter
     private IlEmitter(
         ILGenerator il,
         BoundScript script,
-        bool hasCancellationToken,
         BoundLambda? lambda,
         ClosureScope? incomingClosure)
     {
         _il = il;
         _script = script;
-        _hasCancellationToken = hasCancellationToken;
         _lambda = lambda;
         _incomingClosure = incomingClosure;
     }
@@ -54,11 +49,7 @@ internal sealed partial class IlEmitter
     /// Emits the script body into <paramref name="il"/> and every lambda into its own
     /// <see cref="DynamicMethod"/>, returning the table the host uses to build delegates.
     /// </summary>
-    public static ScriptHost.LambdaEntry[] EmitScript(
-        ILGenerator il,
-        BoundScript script,
-        bool hasCancellationToken,
-        ScriptHost host)
+    public static void EmitScript(ILGenerator il, BoundScript script, ScriptHost host)
     {
         var lambdas = script.Lambdas;
         var methods = new DynamicMethod[lambdas.Count];
@@ -69,7 +60,7 @@ internal sealed partial class IlEmitter
             methods[i] = DefineLambdaMethod(lambdas[i], i);
         }
 
-        new IlEmitter(il, script, hasCancellationToken, null, null).EmitBody();
+        new IlEmitter(il, script, null, null).EmitBody();
 
         var entries = new ScriptHost.LambdaEntry[lambdas.Count];
         for (var i = 0; i < lambdas.Count; i++)
@@ -77,7 +68,7 @@ internal sealed partial class IlEmitter
             var lambda = lambdas[i];
             var incoming = NearestMaterialized(lambda.EnclosingClosure);
 
-            new IlEmitter(methods[i].GetILGenerator(), script, false, lambda, incoming).EmitBody();
+            new IlEmitter(methods[i].GetILGenerator(), script, lambda, incoming).EmitBody();
 
             // A lambda with nothing to capture always receives the host's shared empty closure,
             // so its delegate can be built once here instead of on every evaluation. A capturing
@@ -94,7 +85,6 @@ internal sealed partial class IlEmitter
         }
 
         host.SetLambdas(entries);
-        return entries;
     }
 
     private static DynamicMethod DefineLambdaMethod(BoundLambda lambda, int index)
@@ -130,17 +120,7 @@ internal sealed partial class IlEmitter
             if (!local.IsCaptured)
                 _locals[local] = _il.DeclareLocal(local.Type);
 
-        if (_script.UsesCheckpoints) EmitStateInitialization();
-
-        _returnLabel = _il.DefineLabel();
-        if (_script.ReturnType != typeof(void))
-            _returnValue = _il.DeclareLocal(_script.ReturnType);
-
-        EmitStatement(_script.Body);
-
-        _il.MarkLabel(_returnLabel);
-        if (_returnValue is not null) _il.Emit(OpCodes.Ldloc, _returnValue);
-        _il.Emit(OpCodes.Ret);
+        EmitWithReturnEpilogue(_script.Body, _script.ReturnType);
     }
 
     private void EmitLambdaBody()
@@ -167,10 +147,33 @@ internal sealed partial class IlEmitter
             }
         }
 
-        // An Action's body is still an expression; its value has to be discarded before ret.
-        if (lambda.ReturnType == typeof(void)) EmitAsStatement(lambda.Body);
-        else EmitExpression(lambda.Body);
+        if (lambda.BodyStatement is not null)
+        {
+            EmitWithReturnEpilogue(lambda.BodyStatement, lambda.ReturnType);
+            return;
+        }
 
+        // An Action's body is still an expression; its value has to be discarded before ret.
+        if (lambda.ReturnType == typeof(void)) EmitAsStatement(lambda.Body!);
+        else EmitExpression(lambda.Body!);
+
+        _il.Emit(OpCodes.Ret);
+    }
+
+    /// <summary>
+    /// Emits a statement body followed by the single exit point every <c>return</c> leaves to.
+    /// A bare <c>ret</c> is invalid inside a protected region, so returns stash their value and
+    /// branch here instead.
+    /// </summary>
+    private void EmitWithReturnEpilogue(BoundStatement body, Type returnType)
+    {
+        _returnLabel = _il.DefineLabel();
+        if (returnType != typeof(void)) _returnValue = _il.DeclareLocal(returnType);
+
+        EmitStatement(body);
+
+        _il.MarkLabel(_returnLabel);
+        if (_returnValue is not null) _il.Emit(OpCodes.Ldloc, _returnValue);
         _il.Emit(OpCodes.Ret);
     }
 
@@ -180,35 +183,6 @@ internal sealed partial class IlEmitter
         _il.Emit(OpCodes.Ldarg_0);
         if (_lambda is not null)
             _il.Emit(OpCodes.Callvirt, typeof(ScriptClosure).GetProperty(nameof(ScriptClosure.Host))!.GetMethod!);
-    }
-
-    private void EmitStateInitialization()
-    {
-        _state = _il.DeclareLocal(typeof(ScriptState));
-
-        _il.Emit(OpCodes.Ldarg_0); // ScriptHost
-
-        MethodInfo create;
-        if (_hasCancellationToken)
-        {
-            _il.Emit(OpCodes.Ldarg_1);
-            create = typeof(ScriptState).GetMethod(
-                nameof(ScriptState.Create), [typeof(ScriptHost), typeof(CancellationToken)])!;
-        }
-        else
-        {
-            create = typeof(ScriptState).GetMethod(nameof(ScriptState.Create), [typeof(ScriptHost)])!;
-        }
-
-        _il.Emit(OpCodes.Call, create);
-        _il.Emit(OpCodes.Stloc, _state);
-    }
-
-    private void EmitCheckpoint()
-    {
-        if (_state is null) return;
-        _il.Emit(OpCodes.Ldloca, _state);
-        _il.Emit(OpCodes.Call, typeof(ScriptState).GetMethod(nameof(ScriptState.Checkpoint))!);
     }
 
     // ============================================================ statements
@@ -327,7 +301,6 @@ internal sealed partial class IlEmitter
         _il.Emit(OpCodes.Br, check);
 
         _il.MarkLabel(body);
-        EmitCheckpoint();
         EmitStatement(loop.Body);
 
         _il.MarkLabel(check);
@@ -347,7 +320,6 @@ internal sealed partial class IlEmitter
         _loops.Push((exit, check));
 
         _il.MarkLabel(body);
-        EmitCheckpoint();
         EmitStatement(loop.Body);
 
         _il.MarkLabel(check);
@@ -374,7 +346,6 @@ internal sealed partial class IlEmitter
         _il.Emit(OpCodes.Br, check);
 
         _il.MarkLabel(body);
-        EmitCheckpoint();
         EmitStatement(loop.Body);
 
         _il.MarkLabel(next);
@@ -395,10 +366,6 @@ internal sealed partial class IlEmitter
         _loops.Pop();
     }
 
-    /// <summary>
-    /// Returns always route through a single exit point. A bare <c>ret</c> is invalid inside a
-    /// protected region, so the value is stashed and the method leaves to the common epilogue.
-    /// </summary>
     private void EmitReturn(BoundReturn statement)
     {
         if (statement.Expression is not null && _returnValue is not null)

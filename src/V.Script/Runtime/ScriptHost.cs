@@ -5,7 +5,7 @@ namespace V.Script;
 
 /// <summary>
 /// The object bound as the first argument of every compiled delegate. It gives generated IL
-/// access to the limits configured for the script, and to the table of compiled lambdas.
+/// access to the table of compiled lambdas.
 /// </summary>
 /// <remarks>
 /// Part of the generated-code contract rather than the user-facing API.
@@ -15,14 +15,11 @@ public sealed class ScriptHost
 {
     private LambdaEntry[] _lambdas = [];
 
-    internal ScriptHost(ScriptLimits limits, string sourceName)
+    internal ScriptHost(string sourceName)
     {
-        Limits = limits;
         SourceName = sourceName;
         EmptyClosure = new ScriptClosure(this, null, 0);
     }
-
-    public ScriptLimits Limits { get; }
 
     public string SourceName { get; }
 

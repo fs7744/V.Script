@@ -10,8 +10,7 @@ public abstract class ScriptTest
 {
     protected static ScriptOptions Options { get; } = ScriptOptions.Default
         .AddReferencesFrom(typeof(Order), typeof(ScriptTest))
-        .AddImports("V.Script.Tests")
-        .WithLimits(ScriptLimits.Unlimited);
+        .AddImports("V.Script.Tests");
 
     protected static TResult Run<TGlobals, TResult>(string source, TGlobals globals)
     {
@@ -23,15 +22,11 @@ public abstract class ScriptTest
     protected static TResult Eval<TResult>(string source) =>
         Run<EmptyGlobals, TResult>(source, new EmptyGlobals());
 
-    protected static async Task<TResult> RunAsync<TGlobals, TResult>(
-        string source,
-        TGlobals globals,
-        ScriptLimits? limits = null,
-        CancellationToken cancellationToken = default)
+    protected static async Task<TResult> RunAsync<TGlobals, TResult>(string source, TGlobals globals)
     {
-        using var engine = new ScriptEngine(limits is null ? Options : Options.WithLimits(limits));
+        using var engine = new ScriptEngine(Options);
         using var script = engine.CompileAsync<TGlobals, TResult>(source);
-        return await script.RunAsync(globals, cancellationToken);
+        return await script.RunAsync(globals);
     }
 
     /// <summary>Compiles and returns the diagnostics, expecting failure.</summary>

@@ -4,8 +4,8 @@ using System.Reflection;
 namespace V.Script;
 
 /// <summary>
-/// Compilation settings: which assemblies a script may name types from, which namespaces are
-/// searched for unqualified names, and the execution limits applied at run time.
+/// Compilation settings: which assemblies a script may name types from, and which namespaces
+/// are searched for unqualified names.
 /// </summary>
 public sealed record ScriptOptions
 {
@@ -24,19 +24,16 @@ public sealed record ScriptOptions
         "System.Linq",
     ];
 
-    /// <summary>Core BCL references, the usual three imports, and <see cref="ScriptLimits.Default"/>.</summary>
+    /// <summary>Core BCL references and the usual three imports.</summary>
     public static ScriptOptions Default { get; } = new()
     {
         References = CoreReferences.Distinct().ToImmutableArray(),
         Imports = CoreImports,
-        Limits = ScriptLimits.Default,
     };
 
     public ImmutableArray<Assembly> References { get; init; } = [];
 
     public ImmutableArray<string> Imports { get; init; } = [];
-
-    public ScriptLimits Limits { get; init; } = ScriptLimits.Default;
 
     public ScriptOptions AddReferences(params ReadOnlySpan<Assembly> assemblies)
     {
@@ -63,6 +60,4 @@ public sealed record ScriptOptions
                 builder.Add(ns);
         return this with { Imports = builder.ToImmutable() };
     }
-
-    public ScriptOptions WithLimits(ScriptLimits limits) => this with { Limits = limits };
 }

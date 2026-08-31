@@ -495,12 +495,10 @@ public sealed class Parser
 
             if (kind is SyntaxKind.IsKeyword or SyntaxKind.AsKeyword)
             {
-                var opToken = Advance();
-                var type = ParseType();
+                Advance();
                 left = kind == SyntaxKind.IsKeyword
-                    ? new IsExpressionSyntax(left.Position, left, type)
-                    : new AsExpressionSyntax(left.Position, left, type);
-                _ = opToken;
+                    ? new IsExpressionSyntax(left.Position, left, ParsePattern())
+                    : new AsExpressionSyntax(left.Position, left, ParseType());
                 continue;
             }
 
@@ -600,6 +598,11 @@ public sealed class Parser
                     expression = new PostfixExpressionSyntax(expression.Position, expression, op);
                     break;
                 }
+                case SyntaxKind.SwitchKeyword:
+                {
+                    expression = ParseSwitchExpression(expression);
+                    break;
+                }
                 default:
                     return expression;
             }
@@ -639,6 +642,198 @@ public sealed class Parser
         Expect(SyntaxKind.CloseBracket, "']'");
         return arguments;
     }
+
+    // ============================================================ patterns
+
+    /// <summary>
+    /// <c>and</c>, <c>or</c>, <c>not</c> and <c>when</c> are contextual: they are ordinary
+    /// identifiers everywhere else, so a script may still declare a variable called <c>not</c>.
+    /// </summary>
+    private bool IsContextual(string text) =>
+        Current.Kind == SyntaxKind.Identifier && Current.Text == text;
+
+    /// <summary>A designation cannot be one of the contextual pattern keywords.</summary>
+    private bool AtDesignation() =>
+        Current.Kind == SyntaxKind.Identifier &&
+        !IsContextual("and") && !IsContextual("or") && !IsContextual("when");
+
+    private PatternSyntax ParsePattern() => ParseOrPattern();
+
+    private PatternSyntax ParseOrPattern()
+    {
+        var left = ParseAndPattern();
+
+        while (IsContextual("or"))
+        {
+            Advance();
+            left = new BinaryPatternSyntax(left.Position, left, IsAnd: false, ParseAndPattern());
+        }
+
+        return left;
+    }
+
+    private PatternSyntax ParseAndPattern()
+    {
+        var left = ParseUnaryPattern();
+
+        while (IsContextual("and"))
+        {
+            Advance();
+            left = new BinaryPatternSyntax(left.Position, left, IsAnd: true, ParseUnaryPattern());
+        }
+
+        return left;
+    }
+
+    private PatternSyntax ParseUnaryPattern()
+    {
+        if (!IsContextual("not")) return ParsePrimaryPattern();
+
+        var pos = Advance().Position;
+        return new NotPatternSyntax(pos, ParseUnaryPattern());
+    }
+
+    private PatternSyntax ParsePrimaryPattern()
+    {
+        var pos = Current.Position;
+
+        switch (Current.Kind)
+        {
+            case SyntaxKind.OpenParen:
+            {
+                Advance();
+                var inner = ParsePattern();
+                Expect(SyntaxKind.CloseParen, "')'");
+                return new ParenthesizedPatternSyntax(pos, inner);
+            }
+
+            case SyntaxKind.OpenBrace:
+                return ParsePropertyPattern(pos, null);
+
+            case SyntaxKind.Less:
+            case SyntaxKind.LessEquals:
+            case SyntaxKind.Greater:
+            case SyntaxKind.GreaterEquals:
+            case SyntaxKind.EqualsEquals:
+            case SyntaxKind.BangEquals:
+            {
+                var op = Advance().Kind;
+                return new RelationalPatternSyntax(pos, op, ParseUnary());
+            }
+
+            case SyntaxKind.VarKeyword:
+            {
+                Advance();
+                var name = Expect(SyntaxKind.Identifier, "标识符").Text;
+                return new VarPatternSyntax(pos, name);
+            }
+
+            case SyntaxKind.NullKeyword:
+            case SyntaxKind.TrueKeyword:
+            case SyntaxKind.FalseKeyword:
+            case SyntaxKind.IntLiteral:
+            case SyntaxKind.LongLiteral:
+            case SyntaxKind.UIntLiteral:
+            case SyntaxKind.ULongLiteral:
+            case SyntaxKind.DoubleLiteral:
+            case SyntaxKind.FloatLiteral:
+            case SyntaxKind.DecimalLiteral:
+            case SyntaxKind.StringLiteral:
+            case SyntaxKind.CharLiteral:
+            case SyntaxKind.Minus:
+                return new ConstantPatternSyntax(pos, ParseUnary());
+
+            case SyntaxKind.Identifier when Current.Text == "_" &&
+                                            Peek(1).Kind is not (SyntaxKind.Dot or SyntaxKind.Less
+                                                or SyntaxKind.OpenBrace or SyntaxKind.Identifier):
+                Advance();
+                return new DiscardPatternSyntax(pos);
+
+            case SyntaxKind.Identifier:
+            {
+                var type = ParseType();
+
+                if (Current.Kind == SyntaxKind.OpenBrace) return ParsePropertyPattern(pos, type);
+
+                string? designation = null;
+                if (AtDesignation()) designation = Advance().Text;
+
+                // A name that carries type syntax cannot also be a constant.
+                var mayBeConstant = designation is null &&
+                                    !type.IsNullable &&
+                                    type.ArrayRank == 0 &&
+                                    type.TypeArguments.Count == 0;
+
+                return new TypePatternSyntax(pos, type, designation, mayBeConstant);
+            }
+
+            default:
+                _diagnostics.Report(ErrorCode.ExpectedPattern, pos,
+                    $"应为模式，但遇到 '{Describe(Current)}'。");
+                return new ErrorPatternSyntax(pos);
+        }
+    }
+
+    private PatternSyntax ParsePropertyPattern(SourcePosition pos, TypeSyntax? type)
+    {
+        Expect(SyntaxKind.OpenBrace, "'{'");
+
+        var subpatterns = new List<PropertySubpatternSyntax>();
+        while (Current.Kind is not (SyntaxKind.CloseBrace or SyntaxKind.EndOfFile))
+        {
+            var subPosition = Current.Position;
+            var name = Expect(SyntaxKind.Identifier, "属性名").Text;
+            Expect(SyntaxKind.Colon, "':'");
+
+            subpatterns.Add(new PropertySubpatternSyntax(subPosition, name, ParsePattern()));
+
+            if (!Match(SyntaxKind.Comma)) break;
+        }
+
+        Expect(SyntaxKind.CloseBrace, "'}'");
+
+        string? designation = null;
+        if (AtDesignation()) designation = Advance().Text;
+
+        return new PropertyPatternSyntax(pos, type, subpatterns, designation);
+    }
+
+    private ExpressionSyntax ParseSwitchExpression(ExpressionSyntax governing)
+    {
+        var pos = Advance().Position; // 'switch'
+        Expect(SyntaxKind.OpenBrace, "'{'");
+
+        var arms = new List<SwitchArmSyntax>();
+        while (Current.Kind is not (SyntaxKind.CloseBrace or SyntaxKind.EndOfFile))
+        {
+            var armPosition = Current.Position;
+            var pattern = ParsePattern();
+
+            ExpressionSyntax? guard = null;
+            if (IsContextual("when"))
+            {
+                Advance();
+                guard = ParseExpression();
+            }
+
+            Expect(SyntaxKind.Arrow, "'=>'");
+            arms.Add(new SwitchArmSyntax(armPosition, pattern, guard, ParseExpression()));
+
+            if (!Match(SyntaxKind.Comma)) break;
+        }
+
+        Expect(SyntaxKind.CloseBrace, "'}'");
+
+        if (arms.Count == 0)
+        {
+            _diagnostics.Report(ErrorCode.ExpectedPattern, pos,
+                "switch 表达式至少需要一个分支。");
+        }
+
+        return new SwitchExpressionSyntax(pos, governing, arms);
+    }
+
+    // ============================================================ primaries
 
     private ExpressionSyntax ParsePrimary()
     {

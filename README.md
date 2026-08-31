@@ -2,7 +2,7 @@
 
 A lightweight script execution engine for .NET 11. Scripts are a subset of C# statements, they
 bind against the real CLR type system, and they compile straight to IL — no Roslyn, no
-interpreter. Lambdas, closures and LINQ work, and so does `async`/`await`.
+interpreter. Lambdas, closures, LINQ and pattern matching work, and so does `async`/`await`.
 
 ```csharp
 using var engine = new ScriptEngine();
@@ -34,11 +34,12 @@ depends only on whether the script contains `await`:
 
 | | Carrier | Compile | Memory | Individually unloadable |
 |---|---|---:|---:|---|
-| Synchronous | `DynamicMethod` | 8.9 µs | ~9.7 KB churn | yes, with the delegate |
-| Asynchronous | own collectible assembly | 378 µs | ~31 KB resident | yes, via `Dispose()` |
+| Synchronous | `DynamicMethod` | 7.5 µs | ~10.7 KB churn | yes, with the delegate |
+| Asynchronous | own collectible assembly | 556 µs | ~31 KB resident | yes, via `Dispose()` |
 
 `DynamicMethod` has no `SetImplementationFlags`, so it cannot be marked `Async` — that single
-API gap is the entire reason asynchronous scripts cost 40× more to compile. Retiring an
+API gap is the entire reason asynchronous scripts cost roughly 70× more to compile. Lambdas are
+always `DynamicMethod`s regardless of the carrier, since they hold no suspension point. Retiring an
 asynchronous script releases its assembly; a covering test asserts the memory actually comes
 back.
 
@@ -97,6 +98,37 @@ Scope lifetime follows C# too. A `foreach` variable is fresh each iteration, so 
 outlive the loop each keep their own value; a `for` loop variable is one variable for the whole
 loop, so they all see the last one. Both are covered by tests.
 
+### Pattern matching
+
+```csharp
+var label = engine.Compile<OrderContext, string>(
+    """
+    return Shape switch
+    {
+        Circle c when c.Radius > 10.0 => "big circle",
+        Circle => "circle",
+        Rectangle { Width: > 0, Height: > 0 } r => "rect " + r.Width,
+        null => "none",
+        _ => "other",
+    };
+    """);
+```
+
+`is` accepts the same patterns:
+
+```csharp
+if (Value is int n and > 1) return n * 2;
+if (Order is { Count: > 2, Code: "urgent" }) return -1;
+```
+
+Conjunction narrows the way C# does: in `is int n and > 1` the relational test compares an
+`int`, not the original `object`. A `switch` expression that matches nothing throws
+`SwitchExpressionException` rather than yielding a default, and each arm is its own name scope,
+so two arms may both call their variable `s`.
+
+Patterns lower to ordinary bound expressions — type tests, null tests, comparisons and
+short-circuiting logic — so the emitter has no pattern-specific code at all.
+
 ### Asynchronous scripts
 
 `Compile` and `CompileAsync` are separate on purpose: a synchronous compile that meets `await`
@@ -113,7 +145,7 @@ using var script = engine.CompileAsync<FetchContext, decimal>("""
     return sum * user.DiscountRate;
     """);
 
-decimal value = await script.RunAsync(context, cancellationToken);
+decimal value = await script.RunAsync(context);
 ```
 
 ### Raw delegates
@@ -154,26 +186,47 @@ Error VS3004 (14,13): 'await' 不能出现在 catch 或 finally 块中。
 Codes are grouped: `1xxx` lexical/syntactic, `2xxx` binding and types, `3xxx` async and control
 flow, `9xxx` constructs that are not implemented yet.
 
-## Execution limits
+## Cancellation, and what the engine does not do
 
-Generated IL cannot be interrupted from outside, so limits are cooperative: the compiler injects
-a checkpoint at every loop back-edge, and routes every `await` through `Task.WaitAsync` with the
-script's token.
+The engine imposes no execution limits: no step budget, no timeout, no injected checkpoints.
+`Run` and `RunAsync` are a delegate call and nothing more, and neither takes a
+`CancellationToken`. That is a deliberate choice in favour of throughput — a checkpoint at every
+loop back-edge costs a couple of percent, but the machinery to make a *suspended* script
+interruptible cost far more than that, and it only ever applied to `await`.
+
+Cancellation therefore belongs to the host, and there are two ways to deliver it. Through the
+globals object, which is supplied per call:
 
 ```csharp
-var options = ScriptOptions.Default.WithLimits(new ScriptLimits
+public sealed class Context
 {
-    MaxSteps = 5_000_000,
-    Timeout  = TimeSpan.FromMilliseconds(200),
-});
+    public CancellationToken Token { get; init; }
+    public IOrderService Orders { get; init; }
+}
+```
+```csharp
+var order = await Orders.GetAsync(id, Token);   // script text
+```
+```csharp
+await script.RunAsync(new Context { Token = cts.Token, Orders = orders });
 ```
 
-The `WaitAsync` part is a correctness requirement, not an optimization: a script suspended on an
-`await` never reaches a loop back-edge, so without it a hung remote call would make the timeout
-meaningless.
+Or, for a compiled delegate, as an ordinary parameter — `CancellationToken` needs no special
+handling, it is just a type:
 
-`ScriptLimits.MaxStackDepth` is reserved and currently not enforced — scripts cannot declare
-functions or lambdas, so no script-level recursion is reachable.
+```csharp
+using var f = engine.CompileAsyncDelegate<Func<IOrderService, CancellationToken, Task<int>>>(
+    "(await svc.GetAsync(1, ct)).Total", "svc", "ct");
+
+int total = await f.Value(orders, cts.Token);
+```
+
+Both routes are covered by tests. They are strictly more expressive than an engine-managed
+token — the script decides which calls are cancellable — and cost nothing when unused.
+
+The consequence to be aware of: **a script with a runaway loop will not stop on its own.** Run
+untrusted or author-editable scripts on a thread you are willing to abandon, or validate them
+before compiling. The engine will not do it for you.
 
 ## The language
 
@@ -183,22 +236,25 @@ numeric promotion and nullable lifting, `?.` `??` `??=` `is` `as` `typeof`, cast
 static access, indexers, method calls with overload resolution (`params`, optional and named
 arguments), operator overloading and user-defined conversions, object creation, `if`/`while`/
 `do`/`for`/`foreach`/`break`/`continue`/`return`, `try`/`catch`/`finally`/`throw`, `await`,
-lambdas with by-reference capture, generic method type inference, and extension methods — the
-last three together being what makes LINQ usable.
+lambdas with by-reference capture — expression-bodied or block-bodied, loops and `try` included —
+generic method type inference, and extension methods; the last three together being what makes
+LINQ usable. Pattern matching covers type, constant, relational, `and`/`or`/`not`, `var`,
+discard and property patterns, plus `switch` expressions with `when` guards.
 
 Restrictions worth knowing, each with its own diagnostic:
 
 | | Code | Why |
 |---|---|---|
-| Lambda bodies must be expressions, not `{ }` blocks | `VS9005` | A block can contain a loop, and lambda methods carry no budget checkpoint |
 | No `await` inside a lambda | `VS9006` | A lambda compiles to a separate synchronous method, which cannot hold a suspension point |
 | No `await` inside `catch` or `finally` | `VS3004` | The runtime terminates the process instead of throwing — see below |
 | `var` cannot infer a lambda's type | `VS2017` | Same rule as C#; write the delegate type |
 
 Type inference does not read method groups (`xs.Select(Foo)`), and a type parameter inferred
 from several arguments takes the first binding rather than computing a best common type.
-Pattern matching (`x is Type y`, `switch` expressions) is not parsed at all and reports an
-ordinary syntax error rather than a dedicated code.
+Positional patterns (`is (a, b)`) and list patterns are not implemented, and there is no
+`switch` *statement* — only the expression form. The engine also does not model definite
+assignment, so a pattern variable read on a path where its pattern did not match holds
+`default` instead of being a compile error.
 
 The `await`-in-a-handler restriction is unconditional and cannot be switched off. The runtime
 gives no protection there: a suspension point inside `catch` or `finally` terminates the process
@@ -230,17 +286,16 @@ Execution — both sides are JIT-compiled IL, so parity is the expected result:
 |---|---:|---:|---:|
 | decimal formula | 20.2 ns | 21.4 ns | 0 B |
 | boolean rule | 5.3 ns | 8.7 ns | 0 B |
-| 1000-iteration loop | 3117 ns | 3097 ns | 0 B |
-| 1000-iteration loop, limits on | — | 3163 ns | 0 B |
+| 1000-iteration loop | 3100 ns | 3077 ns | 0 B |
 
-Checkpoints cost about 2% on a tight loop. Compilation, and the cache:
+Compilation, and the cache:
 
 | | |
 |---|---:|
-| sync, small | 8.9 µs |
-| sync, medium (5 statements) | 36.0 µs |
-| async, small | 378 µs |
-| async, loop with `await` | 440 µs |
+| sync, small | 7.5 µs |
+| sync, medium (5 statements) | 26.7 µs |
+| async, small | 556 µs |
+| async, loop with `await` | 597 µs |
 | cache hit | 54.5 ns |
 
 Asynchronous execution (all awaited tasks already completed, so this is the await machinery
@@ -249,22 +304,34 @@ comparison):
 
 | | hand-written C# | script |
 |---|---:|---:|
-| single await | 15.2 ns | 47.6 ns |
-| 10 awaits in a loop | 20.2 ns | 45.4 ns |
-| 10 awaits, limits on | — | 241 ns |
+| single await | 12.4 ns | 25.9 ns |
+| 10 awaits in a loop | 12.0 ns | 24.6 ns |
 
-The gap in the last row is the per-invocation `CancellationTokenSource` and timer that enforce
-`Timeout`, not the generated code. Leaving `Timeout` null and passing your own token keeps
-cancellation working without it.
+`RunAsync` returns the generated method's own task unchanged, so an asynchronous call carries no
+wrapper state machine and no per-invocation timer. Removing the timeout machinery took a single
+await from 47.6 ns to 25.9 ns, and the same script under a timeout from 241 ns to the same
+25.9 ns.
 
 Lambdas and LINQ:
 
 | | hand-written C# | script | allocated |
 |---|---:|---:|---:|
-| predicate, no capture | 4.3 ns | 19.9 ns | 0 B |
-| predicate, capturing | — | 68.3 ns | 184 B |
-| LINQ `Where`/`Select`/`Sum` | 35.6 ns | 59.6 ns | 104 B |
-| `decimal` projection over 3 items | 44.1 ns | 49.8 ns | 40 B |
+| predicate, no capture | 3.9 ns | 19.9 ns | 0 B |
+| predicate, capturing | — | 63.8 ns | 184 B |
+| block-bodied predicate, capturing | 13.2 ns | 58.4 ns | 160 B |
+| LINQ `Where`/`Select`/`Sum` | 33.8 ns | 50.2 ns | 104 B |
+| `decimal` projection over 3 items | 43.2 ns | 50.5 ns | 40 B |
+
+A block body costs no more than an expression body; both compile to the same kind of method.
+
+Pattern matching, classifying eight inputs per invocation so the C# side is not folded away:
+
+| | hand-written C# | script | allocated |
+|---|---:|---:|---:|
+| `switch` expression, 4 arms | 9.3 ns | 23.4 ns | 0 B |
+| `is` type pattern over `object` | 8.0 ns | 18.2 ns | 0 B |
+
+That is roughly 1.8 ns per classification and 1.3 ns per type test, with no allocation.
 
 A non-capturing lambda costs nothing per evaluation — its delegate is built once at compile
 time. A capturing one allocates its closure and binds a delegate to it on every evaluation.
@@ -279,14 +346,15 @@ its caller, while the script's delegate stays opaque.
 ```
 src/V.Script/
   Syntax/       Lexer, Parser, syntax tree            — source to AST
-  Binding/      Binder, Conversions, NumericPromotion, OverloadResolution,
-                GenericInference, TypeResolver        — AST to BoundTree; all semantics live here
+  Binding/      Binder (+.Expressions/.Operators/.Patterns), Conversions, NumericPromotion,
+                OverloadResolution, GenericInference,
+                TypeResolver                          — AST to BoundTree; all semantics live here
   Emit/         IlEmitter, ScriptCarrier              — BoundTree to IL; no type analysis
-  Runtime/      ScriptEngine, Script, ScriptState,
-                ScriptClosure, ClosureBinder          — public API and per-invocation state
+  Runtime/      ScriptEngine, Script, ScriptHost,
+                ScriptClosure, ClosureBinder          — public API and generated-code contract
   Diagnostics/  Diagnostic, DiagnosticBag, ErrorCode
-tests/V.Script.Tests/       339 tests, including the differential suite
-bench/V.Script.Benchmarks/  execution, compilation, async and lambda benchmarks
+tests/V.Script.Tests/       397 tests, including the differential suite
+bench/V.Script.Benchmarks/  execution, compilation, async, lambda and pattern benchmarks
 ```
 
 The load-bearing invariant: **the binder makes everything explicit, the emitter only picks

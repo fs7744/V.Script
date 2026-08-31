@@ -35,7 +35,6 @@ internal sealed partial class IlEmitter
             case BoundAsType asType: EmitAsType(asType); break;
             case BoundTypeofExpression typeofExpression: EmitTypeof(typeofExpression); break;
             case BoundAssignment assignment: EmitAssignment(assignment, leaveValue: true); break;
-            case BoundIntrinsic intrinsic: EmitIntrinsic(intrinsic); break;
             case BoundLambda lambda: EmitLambda(lambda); break;
             case BoundDelegateInvoke invocation: EmitDelegateInvoke(invocation); break;
 
@@ -914,22 +913,6 @@ internal sealed partial class IlEmitter
         _il.Emit(OpCodes.Ldtoken, typeofExpression.TargetType);
         _il.Emit(OpCodes.Call, typeof(Type).GetMethod(
             nameof(Type.GetTypeFromHandle), [typeof(RuntimeTypeHandle)])!);
-    }
-
-    private void EmitIntrinsic(BoundIntrinsic intrinsic)
-    {
-        switch (intrinsic.Kind)
-        {
-            case IntrinsicKind.ScriptStateToken:
-                if (_state is null)
-                    throw new InvalidOperationException("脚本未初始化 ScriptState，无法取消令牌。");
-                _il.Emit(OpCodes.Ldloca, _state);
-                _il.Emit(OpCodes.Call, typeof(ScriptState).GetProperty(nameof(ScriptState.Token))!.GetMethod!);
-                return;
-
-            default:
-                throw new InvalidOperationException($"未处理的内建值 {intrinsic.Kind}。");
-        }
     }
 
     // ============================================================ assignment

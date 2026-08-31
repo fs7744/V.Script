@@ -1,7 +1,5 @@
 using System.Reflection;
 using System.Runtime.CompilerServices;
-using V.Script.Diagnostics;
-
 namespace V.Script.Binding;
 
 /// <summary>
@@ -15,10 +13,6 @@ internal static class AwaitHelpers
     private static readonly MethodInfo AwaitTaskOfT = FindAwait(typeof(Task<>), generic: true);
     private static readonly MethodInfo AwaitValueTask = FindAwait(typeof(ValueTask), generic: false);
     private static readonly MethodInfo AwaitValueTaskOfT = FindAwait(typeof(ValueTask<>), generic: true);
-
-    private static readonly MethodInfo TaskWaitAsync =
-        typeof(Task).GetMethod(nameof(Task.WaitAsync), [typeof(CancellationToken)])
-        ?? throw new InvalidOperationException("Task.WaitAsync(CancellationToken) 不可用。");
 
     private static MethodInfo FindAwait(Type awaitableDefinition, bool generic)
     {
@@ -70,46 +64,4 @@ internal static class AwaitHelpers
         _ => throw new ArgumentOutOfRangeException(nameof(kind)),
     };
 
-    /// <summary>
-    /// <see cref="ValueTask"/> has no <c>WaitAsync</c>, so a cancellable await converts it to a
-    /// <see cref="Task"/> first. Returns null when the operand already is a task.
-    /// </summary>
-    public static (BoundExpression Expression, AwaitKind Kind)? NormalizeForCancellation(
-        BoundExpression operand,
-        AwaitKind kind,
-        Type resultType,
-        SourcePosition position)
-    {
-        switch (kind)
-        {
-            case AwaitKind.Task:
-            case AwaitKind.TaskOfT:
-                return (operand, kind);
-
-            case AwaitKind.ValueTask:
-            {
-                var asTask = typeof(ValueTask).GetMethod(nameof(ValueTask.AsTask), Type.EmptyTypes)!;
-                return (new BoundCall(position, operand, asTask, []), AwaitKind.Task);
-            }
-
-            case AwaitKind.ValueTaskOfT:
-            {
-                var asTask = typeof(ValueTask<>).MakeGenericType(resultType)
-                    .GetMethod("AsTask", Type.EmptyTypes)!;
-                return (new BoundCall(position, operand, asTask, []), AwaitKind.TaskOfT);
-            }
-
-            default:
-                return null;
-        }
-    }
-
-    /// <summary>Returns <c>Task.WaitAsync(CancellationToken)</c> for the operand's task shape.</summary>
-    public static MethodInfo? GetWaitAsync(AwaitKind kind, Type resultType) => kind switch
-    {
-        AwaitKind.Task => TaskWaitAsync,
-        AwaitKind.TaskOfT => typeof(Task<>).MakeGenericType(resultType)
-            .GetMethod(nameof(Task.WaitAsync), [typeof(CancellationToken)]),
-        _ => null,
-    };
 }

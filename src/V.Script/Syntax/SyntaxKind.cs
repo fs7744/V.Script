@@ -94,4 +94,5 @@ public enum SyntaxKind
     IsKeyword,
     AsKeyword,
     TypeofKeyword,
+    SwitchKeyword,
 }

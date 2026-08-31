@@ -18,9 +18,10 @@ internal sealed partial class Binder
     private readonly TypeResolver _resolver;
     private readonly IReadOnlyList<ScriptParameter> _parameters;
     private readonly ScriptParameter? _globals;
-    private readonly Type _returnType;
     private readonly bool _isAsync;
-    private readonly ScriptLimits _limits;
+
+    /// <summary>Swapped while binding a lambda, whose return type is the delegate's.</summary>
+    private Type _returnType;
 
     private readonly List<BoundLambda> _lambdas = [];
     private readonly ClosureScope _rootScope = new(null);
@@ -41,8 +42,7 @@ internal sealed partial class Binder
         TypeResolver resolver,
         IReadOnlyList<ScriptParameter> parameters,
         Type returnType,
-        bool isAsync,
-        ScriptLimits limits)
+        bool isAsync)
     {
         _diagnostics = diagnostics;
         _resolver = resolver;
@@ -50,7 +50,6 @@ internal sealed partial class Binder
         _globals = parameters.FirstOrDefault(p => p.IsGlobals);
         _returnType = returnType;
         _isAsync = isAsync;
-        _limits = limits;
         _scope = new Scope(null);
         _closureScope = _rootScope;
     }
@@ -98,7 +97,6 @@ internal sealed partial class Binder
             _returnType,
             _locals,
             _isAsync,
-            _limits.NeedsCheckpoints,
             _rootScope,
             _lambdas);
     }
@@ -335,6 +333,24 @@ internal sealed partial class Binder
     private BoundStatement BindReturn(ReturnStatementSyntax syntax)
     {
         _sawReturn = true;
+
+        // While probing a block lambda for generic inference the target type is not known yet,
+        // so the returned expression's own type is collected instead of being converted.
+        if (_returnTypeProbe is not null)
+        {
+            if (syntax.Expression is null) return new BoundReturn(syntax.Position, null);
+
+            var probed = BindExpression(syntax.Expression);
+            if (probed is not BoundErrorExpression &&
+                probed.Type != typeof(void) &&
+                probed.Type != Conversions.LambdaType &&
+                probed.Type != Conversions.NullLiteralType)
+            {
+                _returnTypeProbe.Add(probed.Type);
+            }
+
+            return new BoundReturn(syntax.Position, null);
+        }
 
         if (_returnType == typeof(void))
         {

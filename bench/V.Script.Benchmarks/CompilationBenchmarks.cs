@@ -35,7 +35,7 @@ public class CompilationBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        _engine = new ScriptEngine(ScriptOptions.Default.WithLimits(ScriptLimits.Unlimited));
+        _engine = new ScriptEngine(ScriptOptions.Default);
 
         // Warm the reflection caches so the first measured iteration is not an outlier.
         _engine.Compile<PricingContext, decimal>(Unique(SmallSource)).Dispose();
@@ -76,7 +76,7 @@ public class CacheBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        _engine = new ScriptEngine(ScriptOptions.Default.WithLimits(ScriptLimits.Unlimited));
+        _engine = new ScriptEngine(ScriptOptions.Default);
         _engine.Compile<PricingContext, decimal>(Source);
     }
 

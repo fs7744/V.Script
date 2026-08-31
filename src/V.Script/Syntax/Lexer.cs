@@ -38,6 +38,7 @@ public sealed class Lexer
             ["is"] = SyntaxKind.IsKeyword,
             ["as"] = SyntaxKind.AsKeyword,
             ["typeof"] = SyntaxKind.TypeofKeyword,
+            ["switch"] = SyntaxKind.SwitchKeyword,
         }.ToFrozenDictionary(StringComparer.Ordinal);
 
     private static readonly SearchValues<char> DigitChars =

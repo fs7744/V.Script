@@ -24,6 +24,7 @@ public enum ErrorCode
     ExpectedExpression = 1012,
     ExpectedStatement = 1013,
     ExpectedIdentifier = 1014,
+    ExpectedPattern = 1015,
 
     // ---- 2xxx binding / types ----
     UndefinedName = 2001,
@@ -44,6 +45,8 @@ public enum ErrorCode
     CannotInferType = 2017,
     NotAWaitable = 2018,
     ConditionMustBeBool = 2019,
+    PatternNeverMatches = 2025,
+    SwitchArmTypeMismatch = 2026,
     MemberIsNotStatic = 2020,
     MemberIsStatic = 2021,
     PropertyHasNoGetter = 2022,
@@ -58,7 +61,6 @@ public enum ErrorCode
 
     // ---- 9xxx not implemented ----
     GenericMethodInferenceNotSupported = 9002,
-    LambdaBodyNotSupported = 9005,
     AwaitInLambda = 9006,
     ConstructNotSupported = 9010,
 }

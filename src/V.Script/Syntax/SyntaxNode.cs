@@ -94,7 +94,7 @@ public sealed record CastExpressionSyntax(SourcePosition Position, TypeSyntax Ty
 public sealed record AwaitExpressionSyntax(SourcePosition Position, ExpressionSyntax Operand)
     : ExpressionSyntax(Position);
 
-public sealed record IsExpressionSyntax(SourcePosition Position, ExpressionSyntax Operand, TypeSyntax Type)
+public sealed record IsExpressionSyntax(SourcePosition Position, ExpressionSyntax Operand, PatternSyntax Pattern)
     : ExpressionSyntax(Position);
 
 public sealed record AsExpressionSyntax(SourcePosition Position, ExpressionSyntax Operand, TypeSyntax Type)

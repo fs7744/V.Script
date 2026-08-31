@@ -54,25 +54,24 @@ public sealed class ScriptEngine : IDisposable
             return CompileResult<Script<TGlobals, TResult>>.Ok(
                 (Script<TGlobals, TResult>)cached, cached.Diagnostics);
 
-        ScriptParameter[] parameters = [new("<globals>", typeof(TGlobals), IlIndex: 2, IsGlobals: true)];
+        ScriptParameter[] parameters = [new("<globals>", typeof(TGlobals), IlIndex: 1, IsGlobals: true)];
 
         var (bound, diagnostics) = Bind(source, parameters, typeof(TResult), isAsync: false);
         if (bound is null) return CompileResult<Script<TGlobals, TResult>>.Failed(diagnostics);
 
-        var host = new ScriptHost(_options.Limits, Describe(source));
+        var host = new ScriptHost(Describe(source));
 
         var (invoke, owner) = ScriptCarrier.CompileSynchronous(
             bound,
-            typeof(Func<CancellationToken, TGlobals, TResult>),
+            typeof(Func<TGlobals, TResult>),
             [typeof(TGlobals)],
             typeof(TResult),
-            hasCancellationToken: true,
             host,
             host.SourceName);
 
         var script = new Script<TGlobals, TResult>(
             source,
-            (Func<CancellationToken, TGlobals, TResult>)invoke,
+            (Func<TGlobals, TResult>)invoke,
             owner,
             diagnostics,
             () => _cache.TryRemove(key, out _));
@@ -102,28 +101,26 @@ public sealed class ScriptEngine : IDisposable
             return CompileResult<AsyncScript<TGlobals, TResult>>.Ok(
                 (AsyncScript<TGlobals, TResult>)cached, cached.Diagnostics);
 
-        ScriptParameter[] parameters = [new("<globals>", typeof(TGlobals), IlIndex: 2, IsGlobals: true)];
+        ScriptParameter[] parameters = [new("<globals>", typeof(TGlobals), IlIndex: 1, IsGlobals: true)];
 
         var (bound, diagnostics) = Bind(source, parameters, typeof(TResult), isAsync: true);
         if (bound is null) return CompileResult<AsyncScript<TGlobals, TResult>>.Failed(diagnostics);
 
-        var host = new ScriptHost(_options.Limits, Describe(source));
+        var host = new ScriptHost(Describe(source));
 
         var (invoke, owner) = ScriptCarrier.CompileAsynchronous(
             bound,
-            typeof(Func<CancellationToken, TGlobals, Task<TResult>>),
+            typeof(Func<TGlobals, Task<TResult>>),
             [typeof(TGlobals)],
             typeof(TResult),
-            hasCancellationToken: true,
             host,
             host.SourceName);
 
         var script = new AsyncScript<TGlobals, TResult>(
             source,
-            (Func<CancellationToken, TGlobals, Task<TResult>>)invoke,
+            (Func<TGlobals, Task<TResult>>)invoke,
             owner,
             diagnostics,
-            _options.Limits,
             () => _cache.TryRemove(key, out _));
 
         _cache[key] = script;
@@ -159,8 +156,7 @@ public sealed class ScriptEngine : IDisposable
         if (bound is null) throw new ScriptCompilationException(diagnostics);
 
         var (invoke, _) = ScriptCarrier.CompileSynchronous(
-            bound, typeof(TDelegate), parameterTypes, invokeMethod.ReturnType,
-            hasCancellationToken: false, host, host.SourceName);
+            bound, typeof(TDelegate), parameterTypes, invokeMethod.ReturnType, host, host.SourceName);
 
         return (TDelegate)invoke;
     }
@@ -196,8 +192,7 @@ public sealed class ScriptEngine : IDisposable
         if (bound is null) throw new ScriptCompilationException(diagnostics);
 
         var (invoke, owner) = ScriptCarrier.CompileAsynchronous(
-            bound, typeof(TDelegate), parameterTypes, ilReturnType,
-            hasCancellationToken: false, host, host.SourceName);
+            bound, typeof(TDelegate), parameterTypes, ilReturnType, host, host.SourceName);
 
         return new ScriptDelegate<TDelegate>((TDelegate)invoke, owner, diagnostics);
     }
@@ -232,7 +227,7 @@ public sealed class ScriptEngine : IDisposable
             parameters[i] = new ScriptParameter(names[i], parameterTypes[i], IlIndex: i + 1, IsGlobals: false);
 
         var (bound, diagnostics) = Bind(source, parameters, returnType, isAsync);
-        return (bound, diagnostics, new ScriptHost(_options.Limits, Describe(source)), parameterTypes);
+        return (bound, diagnostics, new ScriptHost(Describe(source)), parameterTypes);
     }
 
     // ============================================================ pipeline
@@ -250,7 +245,7 @@ public sealed class ScriptEngine : IDisposable
 
         if (diagnostics.HasErrors) return (null, diagnostics.ToImmutable());
 
-        var binder = new Binding.Binder(diagnostics, _resolver, parameters, returnType, isAsync, _options.Limits);
+        var binder = new Binding.Binder(diagnostics, _resolver, parameters, returnType, isAsync);
         var bound = binder.BindScript(unit);
 
         return diagnostics.HasErrors

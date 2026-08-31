@@ -292,10 +292,10 @@ public sealed class ClosureTests : ScriptTest
 public sealed class LambdaDiagnosticTests : ScriptTest
 {
     [Fact]
-    public void Block_bodied_lambda_is_rejected_with_its_own_code()
+    public void Block_body_without_a_return_on_every_path_is_rejected()
     {
         AssertError<LambdaGlobals, int>(
-            "Fn.Apply(x => { return x; })", ErrorCode.LambdaBodyNotSupported);
+            "Fn.Apply(x => { if (x > 0) return x; })", ErrorCode.NotAllCodePathsReturn);
     }
 
     [Fact]
@@ -338,5 +338,209 @@ public sealed class LambdaDiagnosticTests : ScriptTest
     {
         AssertError<LambdaGlobals, int>(
             "Func<int, int> f = x => \"a\"; return f(1);", ErrorCode.CannotConvert);
+    }
+}
+
+
+/// <summary>
+/// Block bodies. These carry their own return epilogue, so <c>return</c> works inside them —
+/// including from within a <c>try</c>, which needs a <c>leave</c> rather than a bare <c>ret</c>.
+/// </summary>
+public sealed class BlockLambdaTests : ScriptTest
+{
+    [Fact]
+    public void Block_body_with_a_local_and_a_return()
+    {
+        const string source = """
+            Func<int, int> f = x => { var doubled = x * 2; return doubled + 1; };
+            return f(5);
+            """;
+
+        Assert.Equal(11, Run<LambdaGlobals, int>(source, new LambdaGlobals()));
+    }
+
+    [Fact]
+    public void Block_body_with_branching_returns()
+    {
+        const string source = """
+            Func<int, string> f = x =>
+            {
+                if (x > 10) return "big";
+                if (x > 0) return "small";
+                return "none";
+            };
+            return f(5) + f(50) + f(0);
+            """;
+
+        Assert.Equal("smallbignone", Run<LambdaGlobals, string>(source, new LambdaGlobals()));
+    }
+
+    [Fact]
+    public void Block_body_may_contain_a_loop()
+    {
+        const string source = """
+            Func<int, int> f = n =>
+            {
+                var total = 0;
+                for (var i = 1; i <= n; i++) total += i;
+                return total;
+            };
+            return f(10);
+            """;
+
+        Assert.Equal(55, Run<LambdaGlobals, int>(source, new LambdaGlobals()));
+    }
+
+    [Fact]
+    public void Block_body_may_contain_foreach()
+    {
+        const string source = """
+            Func<int[], int> f = xs =>
+            {
+                var total = 0;
+                foreach (var x in xs) total += x;
+                return total;
+            };
+            return f(Numbers);
+            """;
+
+        var globals = new LambdaGlobals { Numbers = [1, 2, 3, 4] };
+        Assert.Equal(10, Run<LambdaGlobals, int>(source, globals));
+    }
+
+    [Fact]
+    public void Return_from_inside_try_leaves_the_protected_region()
+    {
+        const string source = """
+            Func<int, int> f = x =>
+            {
+                try { return x / 0; }
+                catch (DivideByZeroException) { return -1; }
+            };
+            return f(5);
+            """;
+
+        Assert.Equal(-1, Run<LambdaGlobals, int>(source, new LambdaGlobals()));
+    }
+
+    [Fact]
+    public void Finally_inside_a_block_body_still_runs()
+    {
+        const string source = """
+            var log = "";
+            Func<int, int> f = x =>
+            {
+                try { return x; }
+                finally { Counter.Add(1); }
+            };
+            var result = f(7);
+            return result + Counter.Total;
+            """;
+
+        Assert.Equal(8, Run<LambdaGlobals, int>(source, new LambdaGlobals()));
+    }
+
+    [Fact]
+    public void Void_block_body_needs_no_return()
+    {
+        const string source = """
+            Fn.Each(Numbers, x => { Counter.Add(x); });
+            return Counter.Total;
+            """;
+
+        var globals = new LambdaGlobals { Numbers = [1, 2, 3] };
+        Assert.Equal(6, Run<LambdaGlobals, int>(source, globals));
+    }
+
+    [Fact]
+    public void Block_body_captures_by_reference()
+    {
+        const string source = """
+            var seen = 0;
+            Fn.Each(Numbers, x => { seen = seen + x; });
+            return seen;
+            """;
+
+        var globals = new LambdaGlobals { Numbers = [5, 10] };
+        Assert.Equal(15, Run<LambdaGlobals, int>(source, globals));
+    }
+
+    [Fact]
+    public void Block_body_in_linq_infers_from_its_return_statements()
+    {
+        // TResult can only come from the return statements inside the block.
+        const string source = """
+            return Numbers.Select(x => { var scaled = x * 3; return scaled; }).Sum();
+            """;
+
+        var globals = new LambdaGlobals { Numbers = [1, 2, 3] };
+        Assert.Equal(18, Run<LambdaGlobals, int>(source, globals));
+    }
+
+    [Fact]
+    public void Block_predicate_in_linq()
+    {
+        const string source = """
+            var floor = Threshold;
+            return Numbers.Where(x => { return x > floor; }).Count();
+            """;
+
+        var globals = new LambdaGlobals { Numbers = [1, 2, 3, 4], Threshold = 2 };
+        Assert.Equal(2, Run<LambdaGlobals, int>(source, globals));
+    }
+
+    [Fact]
+    public void Nested_lambda_inside_a_block_body()
+    {
+        const string source = """
+            Func<int, int> outer = a =>
+            {
+                Func<int, int> inner = b => a + b;
+                return inner(10);
+            };
+            return outer(5);
+            """;
+
+        Assert.Equal(15, Run<LambdaGlobals, int>(source, new LambdaGlobals()));
+    }
+
+    [Fact]
+    public void Loop_inside_a_block_body_can_break_and_continue()
+    {
+        const string source = """
+            Func<int, int> f = n =>
+            {
+                var total = 0;
+                for (var i = 0; i < n; i++)
+                {
+                    if (i % 2 == 0) continue;
+                    if (i > 7) break;
+                    total += i;
+                }
+                return total;
+            };
+            return f(20);
+            """;
+
+        // 1 + 3 + 5 + 7
+        Assert.Equal(16, Run<LambdaGlobals, int>(source, new LambdaGlobals()));
+    }
+
+    [Fact]
+    public void Block_body_declaring_a_captured_loop_variable()
+    {
+        const string source = """
+            Func<int[], int> f = xs =>
+            {
+                foreach (var x in xs) Sink.Add(() => x);
+                var total = 0;
+                for (var i = 0; i < Sink.Count; i++) total = total * 10 + Sink[i]();
+                return total;
+            };
+            return f(Numbers);
+            """;
+
+        var globals = new LambdaGlobals { Numbers = [1, 2, 3] };
+        Assert.Equal(123, Run<LambdaGlobals, int>(source, globals));
     }
 }

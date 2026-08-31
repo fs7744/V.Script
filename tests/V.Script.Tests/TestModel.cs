@@ -234,3 +234,57 @@ public sealed class Functional
 
     public Func<int, int> Compose(Func<int, int> outer, Func<int, int> inner) => x => outer(inner(x));
 }
+
+// ---------------------------------------------------------------- pattern shapes
+
+public abstract class Shape
+{
+    public string Label { get; init; } = "";
+}
+
+public sealed class Circle : Shape
+{
+    public double Radius { get; init; }
+}
+
+public sealed class Rectangle : Shape
+{
+    public double Width { get; init; }
+    public double Height { get; init; }
+}
+
+public sealed class PatternGlobals
+{
+    public object? Value { get; init; }
+    public Shape? Shape { get; init; }
+    public Order Order { get; init; } = new();
+    public Customer? Customer { get; init; }
+    public Status State { get; init; }
+    public int Number { get; init; }
+    public int? MaybeNumber { get; init; }
+    public string? Text { get; init; }
+}
+
+// ---------------------------------------------------------------- cancellation
+
+public sealed class CancellableGlobals
+{
+    public CancellationToken Token { get; init; }
+    public CancellableService Service { get; init; } = new();
+}
+
+public sealed class CancellableService
+{
+    /// <summary>Never completes on its own; only the token ends the wait.</summary>
+    public async Task<int> WaitForeverAsync(CancellationToken cancellationToken)
+    {
+        await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
+        return 0;
+    }
+
+    public Task<int> EchoAsync(int value, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(value);
+    }
+}

@@ -9,6 +9,9 @@ internal sealed partial class Binder
     private const BindingFlags InstanceFlags = BindingFlags.Public | BindingFlags.Instance;
     private const BindingFlags StaticFlags = BindingFlags.Public | BindingFlags.Static;
 
+    /// <summary>Non-null while probing a block lambda; return statements append their type here.</summary>
+    private List<Type>? _returnTypeProbe;
+
     private ExpressionSyntax? _substituteFor;
     private BoundExpression? _substitute;
     private HashSet<ExpressionSyntax>? _chainNodes;
@@ -59,6 +62,7 @@ internal sealed partial class Binder
         CastExpressionSyntax cast => BindCast(cast),
         AwaitExpressionSyntax await => BindAwait(await),
         IsExpressionSyntax isExpression => BindIs(isExpression),
+        SwitchExpressionSyntax switchExpression => BindSwitchExpression(switchExpression),
         AsExpressionSyntax asExpression => BindAs(asExpression),
         TypeofExpressionSyntax typeofExpression => BindTypeof(typeofExpression),
         ObjectCreationExpressionSyntax creation => BindObjectCreation(creation),
@@ -95,18 +99,14 @@ internal sealed partial class Binder
                 "不支持带 ref / out 参数的委托。");
         }
 
-        if (syntax.Body is not ExpressionSyntax bodyExpression)
-        {
-            return Fail(syntax.Position, ErrorCode.LambdaBodyNotSupported,
-                "只支持表达式形式的 lambda（x => 表达式）。带语句块的 lambda 尚不支持，" +
-                "因为块体可以包含循环，而 lambda 方法内没有注入执行预算检查点。");
-        }
-
         var savedScope = _scope;
         var savedClosure = _closureScope;
         var savedLocals = _locals;
         var savedLoopDepth = _loopDepth;
         var savedHandlerDepth = _handlerDepth;
+        var savedReturnType = _returnType;
+        var savedSawReturn = _sawReturn;
+        var savedProbe = _returnTypeProbe;
 
         _functionDepth++;
         _scope = new Scope(savedScope);
@@ -114,6 +114,9 @@ internal sealed partial class Binder
         _locals = [];
         _loopDepth = 0;
         _handlerDepth = 0;
+        _returnType = invoke.ReturnType;
+        _sawReturn = false;
+        _returnTypeProbe = null;
 
         var ownScope = _closureScope;
         var lambdaParameters = new List<LocalSymbol>(parameters.Length);
@@ -137,11 +140,27 @@ internal sealed partial class Binder
             lambdaParameters.Add(parameter);
         }
 
-        var body = BindExpression(bodyExpression);
         var returnType = invoke.ReturnType;
 
-        if (returnType != typeof(void))
-            body = Convert(body, returnType, syntax.Position, explicitCast: false);
+        BoundExpression? body = null;
+        BoundStatement? bodyStatement = null;
+
+        if (syntax.Body is ExpressionSyntax expressionBody)
+        {
+            body = BindExpression(expressionBody);
+            if (returnType != typeof(void))
+                body = Convert(body, returnType, syntax.Position, explicitCast: false);
+        }
+        else
+        {
+            bodyStatement = BindStatement((StatementSyntax)syntax.Body);
+
+            if (returnType != typeof(void) && !AlwaysReturns(bodyStatement))
+            {
+                _diagnostics.Report(ErrorCode.NotAllCodePathsReturn, syntax.Position,
+                    $"lambda 必须返回 {TypeResolver.Display(returnType)}，但存在没有 return 的执行路径。");
+            }
+        }
 
         var lambdaLocals = _locals;
 
@@ -151,10 +170,13 @@ internal sealed partial class Binder
         _locals = savedLocals;
         _loopDepth = savedLoopDepth;
         _handlerDepth = savedHandlerDepth;
+        _returnType = savedReturnType;
+        _sawReturn = savedSawReturn;
+        _returnTypeProbe = savedProbe;
 
         var lambda = new BoundLambda(
             syntax.Position, delegateType, lambdaParameters, lambdaLocals,
-            body, returnType, ownScope, savedClosure);
+            body, returnType, ownScope, savedClosure, bodyStatement);
 
         _lambdas.Add(lambda);
         return lambda;
@@ -332,6 +354,18 @@ internal sealed partial class Binder
 
     private BoundExpression BindMemberAccess(MemberAccessExpressionSyntax syntax)
     {
+        // A dotted chain may name a type through its namespace, as in System.Math.Max. There is
+        // no namespace value to bind, so the whole chain is offered to the type resolver first —
+        // but only when its head is not already a variable or a globals member, which keeps the
+        // C# order of "locals, then members, then types".
+        if (!syntax.IsNullConditional &&
+            !HeadResolvesAsValue(syntax) &&
+            TryGetDottedName(syntax, out var dotted) &&
+            _resolver.ResolveName(dotted) is { } qualified)
+        {
+            return new BoundTypeReference(syntax.Position, qualified);
+        }
+
         var receiver = BindExpression(syntax.Target);
         if (receiver is BoundErrorExpression) return receiver;
 
@@ -339,6 +373,46 @@ internal sealed partial class Binder
             return BindStaticMember(syntax.Position, typeReference.ReferencedType, syntax.MemberName);
 
         return BindInstanceMember(syntax.Position, receiver, syntax.MemberName);
+    }
+
+    /// <summary>Renders a chain of plain member accesses as a dotted name, or fails.</summary>
+    private static bool TryGetDottedName(ExpressionSyntax syntax, out string dotted)
+    {
+        var parts = new Stack<string>();
+
+        for (var node = syntax; ; )
+        {
+            switch (node)
+            {
+                case MemberAccessExpressionSyntax { IsNullConditional: false } member:
+                    parts.Push(member.MemberName);
+                    node = member.Target;
+                    continue;
+
+                case NameExpressionSyntax name:
+                    parts.Push(name.Name);
+                    dotted = string.Join('.', parts);
+                    return true;
+
+                default:
+                    dotted = string.Empty;
+                    return false;
+            }
+        }
+    }
+
+    /// <summary>True when the leftmost identifier of a chain is a variable or a globals member.</summary>
+    private bool HeadResolvesAsValue(ExpressionSyntax syntax)
+    {
+        var node = syntax;
+        while (node is MemberAccessExpressionSyntax member) node = member.Target;
+
+        if (node is not NameExpressionSyntax name) return false;
+        if (_scope.TryLookup(name.Name, out _)) return true;
+        if (_globals is null) return false;
+
+        return _globals.Type.GetProperty(name.Name, InstanceFlags) is not null ||
+               _globals.Type.GetField(name.Name, InstanceFlags) is not null;
     }
 
     private BoundExpression BindInstanceMember(SourcePosition position, BoundExpression receiver, string name)
@@ -663,7 +737,6 @@ internal sealed partial class Binder
     {
         if (index < 0 || index >= bound.Count) return null;
         if (bound[index] is not BoundUnboundLambda unbound) return null;
-        if (unbound.Syntax.Body is not ExpressionSyntax body) return null;
         if (unbound.Syntax.Parameters.Count != parameterTypes.Length) return null;
 
         var savedDiagnostics = _diagnostics;
@@ -671,6 +744,9 @@ internal sealed partial class Binder
         var savedClosure = _closureScope;
         var savedLocals = _locals;
         var savedFunctionDepth = _functionDepth;
+        var savedProbe = _returnTypeProbe;
+        var savedLoopDepth = _loopDepth;
+        var savedHandlerDepth = _handlerDepth;
         var lambdaCount = _lambdas.Count;
 
         _diagnostics = new DiagnosticBag();
@@ -678,6 +754,8 @@ internal sealed partial class Binder
         _scope = new Scope(savedScope);
         _closureScope = new ClosureScope(savedClosure);
         _locals = [];
+        _loopDepth = 0;
+        _handlerDepth = 0;
 
         try
         {
@@ -692,13 +770,33 @@ internal sealed partial class Binder
                 _scope.TryDeclare(parameter);
             }
 
-            var result = BindExpression(body);
+            if (unbound.Syntax.Body is ExpressionSyntax expressionBody)
+            {
+                _returnTypeProbe = null;
+                var result = BindExpression(expressionBody);
 
-            if (_diagnostics.HasErrors || result is BoundErrorExpression) return null;
-            if (result.Type == typeof(void) || result.Type == Conversions.LambdaType) return null;
-            if (result.Type == Conversions.NullLiteralType) return null;
+                if (_diagnostics.HasErrors || result is BoundErrorExpression) return null;
+                return Usable(result.Type);
+            }
 
-            return result.Type;
+            // A block body contributes the types of its return statements; they are collected
+            // rather than converted, because the target type is what is being inferred.
+            var collected = new List<Type>();
+            _returnTypeProbe = collected;
+
+            BindStatement((StatementSyntax)unbound.Syntax.Body);
+
+            if (_diagnostics.HasErrors || collected.Count == 0) return null;
+
+            var common = collected[0];
+            for (var i = 1; i < collected.Count; i++)
+            {
+                var next = BestCommonType(common, collected[i]);
+                if (next is null) return null;
+                common = next;
+            }
+
+            return Usable(common);
         }
         finally
         {
@@ -707,8 +805,16 @@ internal sealed partial class Binder
             _closureScope = savedClosure;
             _locals = savedLocals;
             _functionDepth = savedFunctionDepth;
+            _returnTypeProbe = savedProbe;
+            _loopDepth = savedLoopDepth;
+            _handlerDepth = savedHandlerDepth;
             _lambdas.RemoveRange(lambdaCount, _lambdas.Count - lambdaCount);
         }
+
+        static Type? Usable(Type type) =>
+            type == typeof(void) || type == Conversions.LambdaType || type == Conversions.NullLiteralType
+                ? null
+                : type;
     }
 
     private static string DescribeCandidates(IReadOnlyList<MethodBase> methods) =>
@@ -862,18 +968,6 @@ internal sealed partial class Binder
         return Convert(operand, target, syntax.Position, explicitCast: true);
     }
 
-    private BoundExpression BindIs(IsExpressionSyntax syntax)
-    {
-        var operand = BindExpression(syntax.Operand);
-        var target = ResolveType(syntax.Type);
-        if (target is null || operand is BoundErrorExpression) return new BoundErrorExpression(syntax.Position);
-
-        if (operand.Type.IsValueType && !Conversions.IsNullableValueType(operand.Type))
-            operand = Convert(operand, typeof(object), syntax.Position, explicitCast: false);
-
-        return new BoundIsType(syntax.Position, operand, target);
-    }
-
     private BoundExpression BindAs(AsExpressionSyntax syntax)
     {
         var operand = BindExpression(syntax.Operand);
@@ -1007,30 +1101,8 @@ internal sealed partial class Binder
         }
 
         var (kind, resultType) = awaited.Value;
-
-        // Route the await through Task.WaitAsync so that a configured timeout or the caller's
-        // cancellation token can interrupt a suspended script. Without this, a pending await
-        // never reaches a checkpoint and the limits would not apply.
-        if (_limits.NeedsCheckpoints)
-        {
-            var normalized = AwaitHelpers.NormalizeForCancellation(operand, kind, resultType, syntax.Position);
-            if (normalized is not null)
-            {
-                operand = AddWaitAsync(normalized.Value.Expression, normalized.Value.Kind, resultType, syntax.Position);
-                kind = normalized.Value.Kind;
-            }
-        }
-
         var helper = AwaitHelpers.GetAwaitMethod(kind, resultType);
+
         return new BoundAwait(syntax.Position, resultType, operand, kind, helper);
-    }
-
-    private BoundExpression AddWaitAsync(BoundExpression task, AwaitKind kind, Type resultType, SourcePosition position)
-    {
-        var waitAsync = AwaitHelpers.GetWaitAsync(kind, resultType);
-        if (waitAsync is null) return task;
-
-        var token = new BoundIntrinsic(position, typeof(CancellationToken), IntrinsicKind.ScriptStateToken);
-        return new BoundCall(position, task, waitAsync, [token]);
     }
 }

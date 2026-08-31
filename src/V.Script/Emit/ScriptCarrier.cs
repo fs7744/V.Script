@@ -9,7 +9,7 @@ namespace V.Script.Emit;
 /// them can host a suspension point:
 /// <list type="bullet">
 ///   <item><b>Synchronous</b> scripts go into a <see cref="DynamicMethod"/> — roughly 1.3 KB and
-///     3 µs per script, reclaimed automatically with the delegate.</item>
+///     a few microseconds per script, reclaimed automatically with the delegate.</item>
 ///   <item><b>Asynchronous</b> scripts need <see cref="MethodImplAttributes.Async"/>, which
 ///     <see cref="DynamicMethod"/> cannot express (it has no <c>SetImplementationFlags</c>), so
 ///     each one gets its own collectible assembly — roughly 31 KB, individually unloadable.</item>
@@ -25,11 +25,10 @@ internal static class ScriptCarrier
         Type delegateType,
         Type[] scriptParameterTypes,
         Type ilReturnType,
-        bool hasCancellationToken,
         ScriptHost host,
         string name)
     {
-        var signature = BuildSignature(scriptParameterTypes, hasCancellationToken);
+        var signature = BuildSignature(scriptParameterTypes);
 
         var method = new DynamicMethod(
             name,
@@ -38,7 +37,7 @@ internal static class ScriptCarrier
             typeof(ScriptCarrier).Module,
             skipVisibility: true);
 
-        IlEmitter.EmitScript(method.GetILGenerator(), script, hasCancellationToken, host);
+        IlEmitter.EmitScript(method.GetILGenerator(), script, host);
 
         return (method.CreateDelegate(delegateType, host), null);
     }
@@ -48,11 +47,10 @@ internal static class ScriptCarrier
         Type delegateType,
         Type[] scriptParameterTypes,
         Type ilReturnType,
-        bool hasCancellationToken,
         ScriptHost host,
         string name)
     {
-        var signature = BuildSignature(scriptParameterTypes, hasCancellationToken);
+        var signature = BuildSignature(scriptParameterTypes);
 
         // The declared return type is Task/Task<T>; the IL body returns the unwrapped value and
         // the runtime performs the wrapping. This is the whole of runtime-async on our side.
@@ -77,7 +75,7 @@ internal static class ScriptCarrier
         method.SetImplementationFlags(
             MethodImplAttributes.IL | MethodImplAttributes.Managed | AsyncImplFlag);
 
-        IlEmitter.EmitScript(method.GetILGenerator(), script, hasCancellationToken, host);
+        IlEmitter.EmitScript(method.GetILGenerator(), script, host);
 
         var created = type.CreateType()!;
         var runtimeMethod = created.GetMethod("Run", BindingFlags.Public | BindingFlags.Static)!;
@@ -86,10 +84,9 @@ internal static class ScriptCarrier
         return (invoke, new GeneratedAssembly(assembly, created));
     }
 
-    private static Type[] BuildSignature(Type[] scriptParameterTypes, bool hasCancellationToken)
+    private static Type[] BuildSignature(Type[] scriptParameterTypes)
     {
-        var signature = new List<Type>(scriptParameterTypes.Length + 2) { typeof(ScriptHost) };
-        if (hasCancellationToken) signature.Add(typeof(CancellationToken));
+        var signature = new List<Type>(scriptParameterTypes.Length + 1) { typeof(ScriptHost) };
         signature.AddRange(scriptParameterTypes);
         return [.. signature];
     }

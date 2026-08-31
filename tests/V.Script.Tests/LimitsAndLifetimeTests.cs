@@ -1,88 +1,13 @@
-using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using V.Script.Diagnostics;
 
 namespace V.Script.Tests;
-
-public sealed class ExecutionLimitTests
-{
-    private static ScriptOptions With(ScriptLimits limits) => ScriptOptions.Default
-        .AddReferencesFrom(typeof(Order))
-        .AddImports("V.Script.Tests")
-        .WithLimits(limits);
-
-    [Fact]
-    public void Step_budget_stops_an_infinite_loop()
-    {
-        using var engine = new ScriptEngine(With(new ScriptLimits { MaxSteps = 100_000 }));
-        using var script = engine.Compile<EmptyGlobals, int>("var i = 0; while (true) { i++; } return i;");
-
-        Assert.Throws<ScriptBudgetExceededException>(() => script.Run(new EmptyGlobals()));
-    }
-
-    [Fact]
-    public void Step_budget_allows_a_loop_that_fits()
-    {
-        using var engine = new ScriptEngine(With(new ScriptLimits { MaxSteps = 100_000 }));
-        using var script = engine.Compile<EmptyGlobals, int>(
-            "var sum = 0; for (var i = 0; i < 1000; i++) sum += i; return sum;");
-
-        Assert.Equal(499_500, script.Run(new EmptyGlobals()));
-    }
-
-    [Fact]
-    public void Budget_is_per_invocation_not_cumulative()
-    {
-        using var engine = new ScriptEngine(With(new ScriptLimits { MaxSteps = 10_000 }));
-        using var script = engine.Compile<EmptyGlobals, int>(
-            "var sum = 0; for (var i = 0; i < 1000; i++) sum += i; return sum;");
-
-        for (var run = 0; run < 5; run++)
-            Assert.Equal(499_500, script.Run(new EmptyGlobals()));
-    }
-
-    [Fact]
-    public void Timeout_stops_a_long_running_synchronous_loop()
-    {
-        using var engine = new ScriptEngine(With(new ScriptLimits { Timeout = TimeSpan.FromMilliseconds(200) }));
-        using var script = engine.Compile<EmptyGlobals, long>("var i = 0L; while (true) { i++; } return i;");
-
-        var stopwatch = Stopwatch.StartNew();
-        Assert.Throws<ScriptTimeoutException>(() => script.Run(new EmptyGlobals()));
-        stopwatch.Stop();
-
-        Assert.True(stopwatch.ElapsedMilliseconds < 10_000,
-            $"超时未生效，耗时 {stopwatch.ElapsedMilliseconds} ms。");
-    }
-
-    [Fact]
-    public void Cancellation_token_stops_a_synchronous_loop()
-    {
-        using var engine = new ScriptEngine(With(new ScriptLimits { MaxSteps = long.MaxValue }));
-        using var script = engine.Compile<EmptyGlobals, long>("var i = 0L; while (true) { i++; } return i;");
-
-        using var cts = new CancellationTokenSource();
-        cts.CancelAfter(200);
-
-        Assert.ThrowsAny<OperationCanceledException>(() => script.Run(new EmptyGlobals(), cts.Token));
-    }
-
-    [Fact]
-    public void Unlimited_skips_checkpoint_emission_entirely()
-    {
-        using var engine = new ScriptEngine(With(ScriptLimits.Unlimited));
-        using var script = engine.Compile<EmptyGlobals, int>(
-            "var sum = 0; for (var i = 0; i < 100000; i++) sum += 1; return sum;");
-
-        Assert.Equal(100_000, script.Run(new EmptyGlobals()));
-    }
-}
 
 public sealed class LifetimeTests
 {
     private static ScriptOptions Options { get; } = ScriptOptions.Default
         .AddReferencesFrom(typeof(Order))
-        .AddImports("V.Script.Tests")
-        .WithLimits(ScriptLimits.Unlimited);
+        .AddImports("V.Script.Tests");
 
     [Fact]
     public void Identical_sources_share_one_compilation()
@@ -148,47 +73,58 @@ public sealed class LifetimeTests
     }
 
     /// <summary>
-    /// Each asynchronous script owns a collectible assembly. Retiring a generation must return
-    /// its memory, otherwise a service that hot-reloads rules grows without bound.
+    /// Each asynchronous script owns a collectible assembly. Retiring one must make its
+    /// generated type unreachable, otherwise a service that hot-reloads rules grows without
+    /// bound. Reachability is asserted directly rather than by watching process memory, which
+    /// is far too noisy a signal to rely on.
     /// </summary>
     [Fact]
-    public void Retiring_async_scripts_returns_their_memory()
+    public void Retiring_an_async_script_makes_its_generated_type_collectable()
     {
-        const int Count = 300;
+        var (weakType, weakAssembly) = CompileAndRetire();
 
-        static long Snapshot()
+        for (var attempt = 0; attempt < 10 && (weakType.IsAlive || weakAssembly.IsAlive); attempt++)
         {
-            for (var i = 0; i < 3; i++)
-            {
-                GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
-                GC.WaitForPendingFinalizers();
-            }
-            Process.GetCurrentProcess().Refresh();
-            return Process.GetCurrentProcess().PrivateMemorySize64;
+            GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+            GC.WaitForPendingFinalizers();
         }
 
+        Assert.False(weakType.IsAlive, "生成的类型仍然可达，程序集没有被卸载。");
+        Assert.False(weakAssembly.IsAlive, "生成的程序集仍然可达。");
+    }
+
+    /// <summary>
+    /// Kept in its own non-inlined frame so the strong references genuinely go out of scope
+    /// before the caller collects.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static (WeakReference Type, WeakReference Assembly) CompileAndRetire()
+    {
         using var engine = new ScriptEngine(Options);
 
-        var baseline = Snapshot();
+        var script = engine.CompileAsync<AsyncGlobals, int>("Seed + 1");
+        var generated = script.Delegate.Method.DeclaringType!;
 
-        var generation = new List<AsyncScript<AsyncGlobals, int>>(Count);
-        for (var i = 0; i < Count; i++)
-            generation.Add(engine.CompileAsync<AsyncGlobals, int>($"Seed + {i}"));
+        var weakType = new WeakReference(generated);
+        var weakAssembly = new WeakReference(generated.Assembly);
 
-        var loaded = Snapshot();
-        var grew = loaded - baseline;
-        Assert.True(grew > 0, "生成程序集后内存没有增长，测试本身失效。");
+        script.Dispose();
+        return (weakType, weakAssembly);
+    }
 
-        foreach (var script in generation) script.Dispose();
-        generation.Clear();
+    /// <summary>A script that is still in use must of course stay loaded.</summary>
+    [Fact]
+    public void A_live_async_script_is_not_collected()
+    {
+        using var engine = new ScriptEngine(Options);
+        using var script = engine.CompileAsync<AsyncGlobals, int>("Seed + 2");
 
-        var released = Snapshot();
+        var weakType = new WeakReference(script.Delegate.Method.DeclaringType!);
 
-        // Collectible assemblies unload asynchronously and loader heaps are page-granular, so
-        // this asserts that the bulk comes back rather than every last byte.
-        Assert.True(released - baseline < grew * 0.75,
-            $"卸载后仅返还 {(grew - (released - baseline)) / 1024.0 / 1024:F1} MB，" +
-            $"占用 {grew / 1024.0 / 1024:F1} MB。");
+        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        GC.WaitForPendingFinalizers();
+
+        Assert.True(weakType.IsAlive);
     }
 
     [Fact]

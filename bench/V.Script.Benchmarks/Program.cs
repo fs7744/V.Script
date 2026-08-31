@@ -24,5 +24,6 @@ BenchmarkSwitcher
         typeof(CacheBenchmarks),
         typeof(AsyncBenchmarks),
         typeof(LambdaBenchmarks),
+        typeof(PatternBenchmarks),
     ])
     .Run(args, config);
