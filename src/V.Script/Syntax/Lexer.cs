@@ -39,6 +39,8 @@ public sealed class Lexer
             ["as"] = SyntaxKind.AsKeyword,
             ["typeof"] = SyntaxKind.TypeofKeyword,
             ["switch"] = SyntaxKind.SwitchKeyword,
+            ["case"] = SyntaxKind.CaseKeyword,
+            ["default"] = SyntaxKind.DefaultKeyword,
         }.ToFrozenDictionary(StringComparer.Ordinal);
 
     private static readonly SearchValues<char> DigitChars =
@@ -46,14 +48,25 @@ public sealed class Lexer
 
     private readonly string _text;
     private readonly DiagnosticBag _diagnostics;
+    private readonly SourcePosition _origin;
     private int _pos;
     private int _line = 1;
     private int _lineStart;
 
     public Lexer(string text, DiagnosticBag diagnostics)
+        : this(text, diagnostics, new SourcePosition(1, 1))
+    {
+    }
+
+    /// <summary>
+    /// Scans <paramref name="text"/> as if it began at <paramref name="origin"/>. Interpolation
+    /// holes are lexed this way so their diagnostics carry positions in the original script.
+    /// </summary>
+    public Lexer(string text, DiagnosticBag diagnostics, SourcePosition origin)
     {
         _text = text ?? throw new ArgumentNullException(nameof(text));
         _diagnostics = diagnostics;
+        _origin = origin;
     }
 
     private char Current => _pos < _text.Length ? _text[_pos] : '\0';
@@ -61,7 +74,16 @@ public sealed class Lexer
     private char Peek(int offset = 1) =>
         _pos + offset < _text.Length ? _text[_pos + offset] : '\0';
 
-    private SourcePosition Here => new(_line, _pos - _lineStart + 1);
+    private SourcePosition Here
+    {
+        get
+        {
+            var column = _pos - _lineStart + 1;
+            return _line == 1
+                ? new SourcePosition(_origin.Line, _origin.Column + column - 1)
+                : new SourcePosition(_origin.Line + _line - 1, column);
+        }
+    }
 
     public List<Token> Tokenize()
     {
@@ -90,6 +112,8 @@ public sealed class Lexer
 
         if (char.IsAsciiDigit(c) || (c == '.' && char.IsAsciiDigit(Peek())))
             return ReadNumber(start);
+
+        if (c == '$' && Peek() == '"') return ReadInterpolatedString(start);
 
         return c switch
         {
@@ -370,6 +394,139 @@ public sealed class Lexer
         }
 
         return new Token(SyntaxKind.StringLiteral, _text[begin.._pos], start, sb.ToString());
+    }
+
+    /// <summary>
+    /// Scans <c>$"..."</c> into literal runs and holes. The hole's source is captured verbatim
+    /// and parsed later; brace, bracket, paren and string nesting are tracked so that a hole
+    /// containing its own braces or strings closes at the right place.
+    /// </summary>
+    private Token ReadInterpolatedString(SourcePosition start)
+    {
+        var begin = _pos;
+        _pos += 2; // $"
+
+        var parts = new List<RawInterpolationPart>();
+        var text = new StringBuilder();
+
+        void FlushText(SourcePosition position)
+        {
+            if (text.Length == 0) return;
+            parts.Add(new RawInterpolationPart(IsHole: false, text.ToString(), position));
+            text.Clear();
+        }
+
+        var runStart = Here;
+
+        while (true)
+        {
+            if (_pos >= _text.Length || Current == '\n')
+            {
+                _diagnostics.Report(ErrorCode.UnterminatedString, start, "插值字符串未闭合。");
+                break;
+            }
+
+            if (Current == '"') { _pos++; break; }
+
+            if (Current == '{' && Peek() == '{') { text.Append('{'); _pos += 2; continue; }
+            if (Current == '}' && Peek() == '}') { text.Append('}'); _pos += 2; continue; }
+
+            if (Current == '}')
+            {
+                _diagnostics.Report(ErrorCode.UnexpectedCharacter, Here,
+                    "插值字符串中的 '}' 需要写成 '}}'。");
+                _pos++;
+                continue;
+            }
+
+            if (Current == '{')
+            {
+                FlushText(runStart);
+                ReadInterpolationHole(parts);
+                runStart = Here;
+                continue;
+            }
+
+            if (Current == '\\')
+            {
+                _pos++;
+                if (TryReadEscape(out var decoded)) text.Append(decoded);
+                continue;
+            }
+
+            text.Append(Current);
+            _pos++;
+        }
+
+        FlushText(runStart);
+        return new Token(SyntaxKind.InterpolatedStringLiteral, _text[begin.._pos], start, parts);
+    }
+
+    private void ReadInterpolationHole(List<RawInterpolationPart> parts)
+    {
+        _pos++; // '{'
+        var holeStart = Here;
+        var begin = _pos;
+
+        var depth = 0;
+        var alignmentAt = -1;
+        var formatAt = -1;
+
+        while (_pos < _text.Length)
+        {
+            var c = Current;
+
+            if (c == '"' || c == '\'')
+            {
+                SkipNestedLiteral(c);
+                continue;
+            }
+
+            if (c is '(' or '[' or '{') { depth++; _pos++; continue; }
+
+            if (c == ')' || c == ']') { depth--; _pos++; continue; }
+
+            if (c == '}')
+            {
+                if (depth == 0) break;
+                depth--;
+                _pos++;
+                continue;
+            }
+
+            // At the top level of a hole, ',' starts the alignment and ':' the format specifier.
+            // A conditional expression therefore has to be parenthesised, exactly as in C#.
+            if (depth == 0 && c == ',' && alignmentAt < 0 && formatAt < 0) alignmentAt = _pos;
+            if (depth == 0 && c == ':' && formatAt < 0) formatAt = _pos;
+
+            _pos++;
+        }
+
+        var end = _pos;
+        if (_pos < _text.Length && Current == '}') _pos++;
+        else _diagnostics.Report(ErrorCode.UnterminatedString, holeStart, "插值项缺少 '}'。");
+
+        var expressionEnd = alignmentAt >= 0 ? alignmentAt : formatAt >= 0 ? formatAt : end;
+
+        var expression = _text[begin..expressionEnd];
+        var alignment = alignmentAt >= 0
+            ? _text[(alignmentAt + 1)..(formatAt >= 0 ? formatAt : end)]
+            : null;
+        var format = formatAt >= 0 ? _text[(formatAt + 1)..end] : null;
+
+        parts.Add(new RawInterpolationPart(IsHole: true, expression, holeStart, alignment, format));
+    }
+
+    /// <summary>Skips a string or char literal inside an interpolation hole.</summary>
+    private void SkipNestedLiteral(char quote)
+    {
+        _pos++;
+        while (_pos < _text.Length && Current != quote)
+        {
+            if (Current == '\\') _pos++;
+            _pos++;
+        }
+        if (_pos < _text.Length) _pos++;
     }
 
     private Token ReadChar(SourcePosition start)

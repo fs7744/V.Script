@@ -66,6 +66,12 @@ internal sealed partial class Binder
         AsExpressionSyntax asExpression => BindAs(asExpression),
         TypeofExpressionSyntax typeofExpression => BindTypeof(typeofExpression),
         ObjectCreationExpressionSyntax creation => BindObjectCreation(creation),
+        ArrayCreationExpressionSyntax array => BindArrayCreation(array),
+        CollectionExpressionSyntax collection => new BoundUnboundCollection(collection.Position, collection),
+        DefaultExpressionSyntax defaultValue => BindDefault(defaultValue),
+        ThrowExpressionSyntax thrown => BindThrowExpression(thrown),
+        NameOfExpressionSyntax nameOf => BindNameOf(nameOf),
+        InterpolatedStringExpressionSyntax interpolated => BindInterpolatedString(interpolated),
         LambdaExpressionSyntax lambda => new BoundUnboundLambda(lambda.Position, lambda),
         ErrorExpressionSyntax => new BoundErrorExpression(syntax.Position),
         _ => Fail(syntax.Position, ErrorCode.ConstructNotSupported, "不支持的表达式。"),
@@ -103,6 +109,7 @@ internal sealed partial class Binder
         var savedClosure = _closureScope;
         var savedLocals = _locals;
         var savedLoopDepth = _loopDepth;
+        var savedSwitchDepth = _switchDepth;
         var savedHandlerDepth = _handlerDepth;
         var savedReturnType = _returnType;
         var savedSawReturn = _sawReturn;
@@ -113,6 +120,7 @@ internal sealed partial class Binder
         _closureScope = new ClosureScope(savedClosure);
         _locals = [];
         _loopDepth = 0;
+        _switchDepth = 0;
         _handlerDepth = 0;
         _returnType = invoke.ReturnType;
         _sawReturn = false;
@@ -123,8 +131,23 @@ internal sealed partial class Binder
 
         for (var i = 0; i < parameters.Length; i++)
         {
+            var written = syntax.Parameters[i];
+
+            // A written type has to be the delegate's type exactly, as in C# — it is a check,
+            // not a conversion.
+            if (written.Type is not null)
+            {
+                var declared = ResolveType(written.Type);
+                if (declared is not null && declared != parameters[i].ParameterType)
+                {
+                    _diagnostics.Report(ErrorCode.CannotConvert, written.Position,
+                        $"lambda 参数 '{written.Name}' 声明为 {TypeResolver.Display(declared)}，但 " +
+                        $"{TypeResolver.Display(delegateType)} 要求 {TypeResolver.Display(parameters[i].ParameterType)}。");
+                }
+            }
+
             // Argument 0 of the generated lambda method is always its closure.
-            var parameter = new LocalSymbol(syntax.Parameters[i], parameters[i].ParameterType)
+            var parameter = new LocalSymbol(written.Name, parameters[i].ParameterType)
             {
                 LambdaArgIndex = i + 1,
             };
@@ -169,6 +192,7 @@ internal sealed partial class Binder
         _closureScope = savedClosure;
         _locals = savedLocals;
         _loopDepth = savedLoopDepth;
+        _switchDepth = savedSwitchDepth;
         _handlerDepth = savedHandlerDepth;
         _returnType = savedReturnType;
         _sawReturn = savedSawReturn;
@@ -572,6 +596,27 @@ internal sealed partial class Binder
             ? []
             : _resolver.GetExtensionMethods(methodName);
 
+        if (syntax.TypeArguments is { Count: > 0 } typeArgumentSyntax)
+        {
+            var typeArguments = new Type[typeArgumentSyntax.Count];
+            for (var i = 0; i < typeArguments.Length; i++)
+            {
+                var resolved = ResolveType(typeArgumentSyntax[i]);
+                if (resolved is null) return new BoundErrorExpression(syntax.Position);
+                typeArguments[i] = resolved;
+            }
+
+            methods = Substitute(methods, typeArguments).Cast<MethodBase>().ToList();
+            extensions = Substitute(extensions, typeArguments).ToList();
+
+            if (methods.Count == 0 && extensions.Count == 0)
+            {
+                return Fail(syntax.Position, ErrorCode.NoMatchingOverload,
+                    $"'{methodName}' 没有接受 {typeArguments.Length} 个类型参数、" +
+                    "且满足其约束的泛型重载。");
+            }
+        }
+
         if (methods.Count == 0 && extensions.Count == 0)
         {
             // A member holding a delegate is invoked rather than called.
@@ -730,6 +775,45 @@ internal sealed partial class Binder
     }
 
     /// <summary>
+    /// The delegate type a lambda has on its own, which exists only when every parameter type is
+    /// written out. The return type is probed from the body; a body with no value is an
+    /// <c>Action</c>, which is also what a body that fails to bind falls back to — the real
+    /// diagnostics then come from binding it for real.
+    /// </summary>
+    private Type? NaturalDelegateType(LambdaExpressionSyntax syntax)
+    {
+        if (syntax.Parameters.Any(p => p.Type is null)) return null;
+
+        var parameterTypes = new Type[syntax.Parameters.Count];
+        for (var i = 0; i < parameterTypes.Length; i++)
+        {
+            var resolved = ResolveType(syntax.Parameters[i].Type!);
+            if (resolved is null) return null;
+            parameterTypes[i] = resolved;
+        }
+
+        var returnType = ProbeLambdaReturn(syntax, parameterTypes) ?? typeof(void);
+        return MakeDelegateType(parameterTypes, returnType);
+    }
+
+    /// <summary>The <c>Func</c> or <c>Action</c> for a signature, or null when it does not fit one.</summary>
+    private static Type? MakeDelegateType(Type[] parameterTypes, Type returnType)
+    {
+        if (parameterTypes.Any(t => t == typeof(void))) return null;
+
+        var isAction = returnType == typeof(void);
+        if (isAction && parameterTypes.Length == 0) return typeof(Action);
+
+        var arity = parameterTypes.Length + (isAction ? 0 : 1);
+        if (arity > 16) return null;
+
+        var definition = Type.GetType($"System.{(isAction ? "Action" : "Func")}`{arity}");
+        if (definition is null) return null;
+
+        return definition.MakeGenericType(isAction ? parameterTypes : [.. parameterTypes, returnType]);
+    }
+
+    /// <summary>
     /// Binds a lambda argument's body speculatively so that generic inference can learn its
     /// return type. Diagnostics and any lambdas it creates are discarded; only the type escapes.
     /// </summary>
@@ -737,7 +821,13 @@ internal sealed partial class Binder
     {
         if (index < 0 || index >= bound.Count) return null;
         if (bound[index] is not BoundUnboundLambda unbound) return null;
-        if (unbound.Syntax.Parameters.Count != parameterTypes.Length) return null;
+
+        return ProbeLambdaReturn(unbound.Syntax, parameterTypes);
+    }
+
+    private Type? ProbeLambdaReturn(LambdaExpressionSyntax syntax, Type[] parameterTypes)
+    {
+        if (syntax.Parameters.Count != parameterTypes.Length) return null;
 
         var savedDiagnostics = _diagnostics;
         var savedScope = _scope;
@@ -746,6 +836,7 @@ internal sealed partial class Binder
         var savedFunctionDepth = _functionDepth;
         var savedProbe = _returnTypeProbe;
         var savedLoopDepth = _loopDepth;
+        var savedSwitchDepth = _switchDepth;
         var savedHandlerDepth = _handlerDepth;
         var lambdaCount = _lambdas.Count;
 
@@ -755,13 +846,14 @@ internal sealed partial class Binder
         _closureScope = new ClosureScope(savedClosure);
         _locals = [];
         _loopDepth = 0;
+        _switchDepth = 0;
         _handlerDepth = 0;
 
         try
         {
             for (var i = 0; i < parameterTypes.Length; i++)
             {
-                var parameter = new LocalSymbol(unbound.Syntax.Parameters[i], parameterTypes[i])
+                var parameter = new LocalSymbol(syntax.Parameters[i].Name, parameterTypes[i])
                 {
                     LambdaArgIndex = i + 1,
                 };
@@ -770,7 +862,7 @@ internal sealed partial class Binder
                 _scope.TryDeclare(parameter);
             }
 
-            if (unbound.Syntax.Body is ExpressionSyntax expressionBody)
+            if (syntax.Body is ExpressionSyntax expressionBody)
             {
                 _returnTypeProbe = null;
                 var result = BindExpression(expressionBody);
@@ -784,7 +876,7 @@ internal sealed partial class Binder
             var collected = new List<Type>();
             _returnTypeProbe = collected;
 
-            BindStatement((StatementSyntax)unbound.Syntax.Body);
+            BindStatement((StatementSyntax)syntax.Body);
 
             if (_diagnostics.HasErrors || collected.Count == 0) return null;
 
@@ -807,19 +899,44 @@ internal sealed partial class Binder
             _functionDepth = savedFunctionDepth;
             _returnTypeProbe = savedProbe;
             _loopDepth = savedLoopDepth;
+            _switchDepth = savedSwitchDepth;
             _handlerDepth = savedHandlerDepth;
             _lambdas.RemoveRange(lambdaCount, _lambdas.Count - lambdaCount);
         }
 
         static Type? Usable(Type type) =>
-            type == typeof(void) || type == Conversions.LambdaType || type == Conversions.NullLiteralType
-                ? null
-                : type;
+            type == typeof(void) || Conversions.IsUntyped(type) ? null : type;
     }
 
     private static string DescribeCandidates(IReadOnlyList<MethodBase> methods) =>
         string.Join(", ", methods.Take(4).Select(m =>
             $"{m.Name}({string.Join(", ", m.GetParameters().Select(p => TypeResolver.Display(p.ParameterType)))})"));
+
+    /// <summary>
+    /// Applies explicit type arguments, keeping only the generic definitions of the right arity
+    /// whose constraints the arguments satisfy. Everything downstream then sees ordinary
+    /// constructed methods, so overload resolution needs no notion of explicit type arguments.
+    /// </summary>
+    private static IEnumerable<MethodInfo> Substitute(IEnumerable<MethodBase> candidates, Type[] typeArguments)
+    {
+        foreach (var candidate in candidates)
+        {
+            if (candidate is not MethodInfo method || !method.IsGenericMethodDefinition) continue;
+            if (method.GetGenericArguments().Length != typeArguments.Length) continue;
+
+            MethodInfo constructed;
+            try
+            {
+                constructed = method.MakeGenericMethod(typeArguments);
+            }
+            catch (ArgumentException)
+            {
+                continue; // constraints not satisfied
+            }
+
+            yield return constructed;
+        }
+    }
 
     private static List<MethodBase> GatherMethods(Type type, string name, bool staticOnly)
     {
@@ -994,40 +1111,6 @@ internal sealed partial class Binder
             : new BoundTypeofExpression(syntax.Position, target);
     }
 
-    private BoundExpression BindObjectCreation(ObjectCreationExpressionSyntax syntax)
-    {
-        var type = ResolveType(syntax.Type);
-        if (type is null) return new BoundErrorExpression(syntax.Position);
-
-        var arguments = syntax.Arguments
-            .Select(a => (Argument: a, Bound: BindExpression(a.Value)))
-            .ToArray();
-
-        if (arguments.Any(a => a.Bound is BoundErrorExpression))
-            return new BoundErrorExpression(syntax.Position);
-
-        if (type.IsValueType && arguments.Length == 0)
-            return new BoundDefault(syntax.Position, type);
-
-        var constructors = type
-            .GetConstructors(BindingFlags.Public | BindingFlags.Instance)
-            .Cast<MethodBase>()
-            .ToArray();
-
-        var infos = arguments.Select(a => Describe(a.Bound, a.Argument.Name)).ToArray();
-        var resolution = OverloadResolution.Resolve(constructors, infos);
-
-        if (resolution.Outcome != OverloadOutcome.Resolved)
-        {
-            return Fail(syntax.Position, ErrorCode.NoMatchingOverload,
-                $"{TypeResolver.Display(type)} 没有匹配 " +
-                $"({string.Join(", ", infos.Select(i => TypeResolver.Display(i.Type)))}) 的构造函数。");
-        }
-
-        var finalArguments = BuildArguments(resolution.Best!, arguments.Select(a => a.Bound).ToArray(), syntax.Position);
-        return new BoundObjectCreation(syntax.Position, (ConstructorInfo)resolution.Best!.Method, finalArguments);
-    }
-
     private BoundExpression BindConditionalExpression(ConditionalExpressionSyntax syntax)
     {
         var condition = BindCondition(syntax.Condition);
@@ -1042,6 +1125,11 @@ internal sealed partial class Binder
                 $"{TypeResolver.Display(whenFalse.Type)}。");
         }
 
+        // Both branches untyped: leave them alone so that whatever consumes the conditional can
+        // push its own target type down into them.
+        if (Conversions.AdoptsTargetType(type))
+            return new BoundConditional(syntax.Position, type, condition, whenTrue, whenFalse);
+
         return new BoundConditional(
             syntax.Position, type, condition,
             Convert(whenTrue, type, syntax.Position, explicitCast: false),
@@ -1051,6 +1139,12 @@ internal sealed partial class Binder
     private static Type? BestCommonType(Type left, Type right)
     {
         if (left == right) return left;
+
+        // `default`, a throw expression and a collection expression take whatever the other
+        // branch is; they never drive the choice themselves.
+        if (Conversions.AdoptsTargetType(left)) return Conversions.AdoptsTargetType(right) ? null : right;
+        if (Conversions.AdoptsTargetType(right)) return left;
+
         if (left == Conversions.NullLiteralType) return Conversions.IsNullAssignable(right) ? right : Conversions.Lift(right);
         if (right == Conversions.NullLiteralType) return Conversions.IsNullAssignable(left) ? left : Conversions.Lift(left);
 

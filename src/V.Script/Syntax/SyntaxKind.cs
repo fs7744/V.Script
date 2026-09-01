@@ -16,6 +16,7 @@ public enum SyntaxKind
     FloatLiteral,
     DecimalLiteral,
     StringLiteral,
+    InterpolatedStringLiteral,
     CharLiteral,
 
     // punctuation
@@ -95,4 +96,6 @@ public enum SyntaxKind
     AsKeyword,
     TypeofKeyword,
     SwitchKeyword,
+    CaseKeyword,
+    DefaultKeyword,
 }

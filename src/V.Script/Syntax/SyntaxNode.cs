@@ -72,12 +72,14 @@ public sealed record MemberAccessExpressionSyntax(
     SourcePosition Position,
     ExpressionSyntax Target,
     string MemberName,
-    bool IsNullConditional) : ExpressionSyntax(Position);
+    bool IsNullConditional,
+    IReadOnlyList<TypeSyntax>? TypeArguments = null) : ExpressionSyntax(Position);
 
 public sealed record InvocationExpressionSyntax(
     SourcePosition Position,
     ExpressionSyntax Target,
-    IReadOnlyList<ArgumentSyntax> Arguments) : ExpressionSyntax(Position);
+    IReadOnlyList<ArgumentSyntax> Arguments,
+    IReadOnlyList<TypeSyntax>? TypeArguments = null) : ExpressionSyntax(Position);
 
 public sealed record ArgumentSyntax(SourcePosition Position, string? Name, ExpressionSyntax Value)
     : SyntaxNode(Position);
@@ -106,15 +108,90 @@ public sealed record TypeofExpressionSyntax(SourcePosition Position, TypeSyntax 
 public sealed record ObjectCreationExpressionSyntax(
     SourcePosition Position,
     TypeSyntax Type,
-    IReadOnlyList<ArgumentSyntax> Arguments) : ExpressionSyntax(Position);
+    IReadOnlyList<ArgumentSyntax> Arguments,
+    InitializerSyntax? Initializer = null) : ExpressionSyntax(Position);
+
+public abstract record InitializerSyntax(SourcePosition Position) : SyntaxNode(Position);
+
+/// <summary><c>{ Name = value, Other = value }</c></summary>
+public sealed record ObjectInitializerSyntax(
+    SourcePosition Position,
+    IReadOnlyList<MemberInitializerSyntax> Members) : InitializerSyntax(Position);
+
+public sealed record MemberInitializerSyntax(
+    SourcePosition Position,
+    string Name,
+    ExpressionSyntax Value) : SyntaxNode(Position);
+
+/// <summary><c>{ 1, 2, 3 }</c> — each element becomes an <c>Add</c> call.</summary>
+public sealed record CollectionInitializerSyntax(
+    SourcePosition Position,
+    IReadOnlyList<ExpressionSyntax> Elements) : InitializerSyntax(Position);
+
+/// <summary>
+/// <c>new int[3]</c>, <c>new int[] { 1, 2 }</c> and <c>new[] { 1, 2 }</c>. A null
+/// <paramref name="ElementType"/> means the element type comes from the elements.
+/// </summary>
+public sealed record ArrayCreationExpressionSyntax(
+    SourcePosition Position,
+    TypeSyntax? ElementType,
+    ExpressionSyntax? Length,
+    IReadOnlyList<ExpressionSyntax>? Elements) : ExpressionSyntax(Position);
+
+/// <summary>A <c>$"..."</c> string, already split into literal text and interpolation holes.</summary>
+/// <summary>
+/// <c>[a, b, c]</c>. Like a lambda it has no type of its own — the target type decides whether
+/// it becomes an array, a <c>List&lt;T&gt;</c>, or something else with an <c>Add</c> method.
+/// </summary>
+public sealed record CollectionExpressionSyntax(
+    SourcePosition Position,
+    IReadOnlyList<ExpressionSyntax> Elements) : ExpressionSyntax(Position);
+
+/// <summary><c>default</c> (Type null) or <c>default(T)</c>.</summary>
+public sealed record DefaultExpressionSyntax(
+    SourcePosition Position,
+    TypeSyntax? Type) : ExpressionSyntax(Position);
+
+/// <summary><c>x ?? throw new E()</c>. Produces no value, so it fits any target type.</summary>
+public sealed record ThrowExpressionSyntax(
+    SourcePosition Position,
+    ExpressionSyntax Exception) : ExpressionSyntax(Position);
+
+/// <summary><c>nameof(x)</c>. The operand is never evaluated, only spelled.</summary>
+public sealed record NameOfExpressionSyntax(
+    SourcePosition Position,
+    ExpressionSyntax Operand) : ExpressionSyntax(Position);
+
+public sealed record InterpolatedStringExpressionSyntax(
+    SourcePosition Position,
+    IReadOnlyList<InterpolationPartSyntax> Parts) : ExpressionSyntax(Position);
+
+public sealed record InterpolationPartSyntax(
+    SourcePosition Position,
+    string? Text,
+    ExpressionSyntax? Value,
+    string? Alignment,
+    string? Format) : SyntaxNode(Position)
+{
+    public bool IsHole => Value is not null;
+}
 
 /// <summary>
 /// Parsed but not yet bindable. Recognising the shape lets the binder emit a precise
 /// "not supported" diagnostic instead of a confusing syntax error.
 /// </summary>
+/// <summary>
+/// One lambda or local-function parameter. <paramref name="Type"/> is null for a lambda
+/// parameter written bare, where the target delegate supplies the type.
+/// </summary>
+public sealed record LambdaParameterSyntax(
+    SourcePosition Position,
+    TypeSyntax? Type,
+    string Name) : SyntaxNode(Position);
+
 public sealed record LambdaExpressionSyntax(
     SourcePosition Position,
-    IReadOnlyList<string> Parameters,
+    IReadOnlyList<LambdaParameterSyntax> Parameters,
     SyntaxNode Body) : ExpressionSyntax(Position);
 
 /// <summary>Placeholder produced after a parse error so parsing can continue.</summary>
@@ -171,6 +248,34 @@ public sealed record ContinueStatementSyntax(SourcePosition Position) : Statemen
 
 public sealed record ThrowStatementSyntax(SourcePosition Position, ExpressionSyntax Expression)
     : StatementSyntax(Position);
+
+/// <summary>
+/// <c>int F(int x) { ... }</c>. Every parameter and the return type are written out — there is
+/// nothing for the binder to infer. A null <paramref name="ReturnType"/> means <c>void</c>.
+/// </summary>
+public sealed record LocalFunctionStatementSyntax(
+    SourcePosition Position,
+    TypeSyntax? ReturnType,
+    string Name,
+    IReadOnlyList<LambdaParameterSyntax> Parameters,
+    SyntaxNode Body) : StatementSyntax(Position);
+
+public sealed record SwitchStatementSyntax(
+    SourcePosition Position,
+    ExpressionSyntax Governing,
+    IReadOnlyList<SwitchSectionSyntax> Sections) : StatementSyntax(Position);
+
+/// <summary>One or more labels sharing a body. Falling out of the body is not allowed.</summary>
+public sealed record SwitchSectionSyntax(
+    SourcePosition Position,
+    IReadOnlyList<SwitchLabelSyntax> Labels,
+    IReadOnlyList<StatementSyntax> Statements) : SyntaxNode(Position);
+
+/// <summary>A <c>case</c> label, or <c>default:</c> when <paramref name="Pattern"/> is null.</summary>
+public sealed record SwitchLabelSyntax(
+    SourcePosition Position,
+    PatternSyntax? Pattern,
+    ExpressionSyntax? Guard) : SyntaxNode(Position);
 
 public sealed record CatchClauseSyntax(
     SourcePosition Position,

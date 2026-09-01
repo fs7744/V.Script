@@ -114,7 +114,7 @@ public static class GenericInference
     /// </summary>
     private static void Unify(Type parameter, Type argument, Dictionary<Type, Type> bound)
     {
-        if (argument == Conversions.NullLiteralType || argument == Conversions.LambdaType) return;
+        if (Conversions.IsUntyped(argument)) return;
 
         if (parameter.IsGenericParameter)
         {

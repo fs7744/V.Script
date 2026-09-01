@@ -33,6 +33,9 @@ internal sealed partial class Binder
     private LocalSymbol? _globalsLocal;
     private int _functionDepth;
     private int _loopDepth;
+
+    /// <summary>Nesting of <c>switch</c> statements, which <c>break</c> also leaves.</summary>
+    private int _switchDepth;
     private int _handlerDepth;
     private int _tempCounter;
     private bool _sawReturn;
@@ -74,11 +77,9 @@ internal sealed partial class Binder
 
         if (_globals is not null) _globalsLocal = _parameterLocals[_globals];
 
-        for (var i = 0; i < unit.Statements.Count; i++)
-        {
-            var isLast = i == unit.Statements.Count - 1;
-            statements.Add(BindTopLevelStatement(unit.Statements[i], isLast));
-        }
+        statements.AddRange(BindStatementList(
+            unit.Statements,
+            (statement, i) => BindTopLevelStatement(statement, i == unit.Statements.Count - 1)));
 
         var body = new BoundBlock(unit.Position, statements,
             _rootScope.IsMaterialized ? _rootScope : null);
@@ -154,10 +155,22 @@ internal sealed partial class Binder
         BreakStatementSyntax brk => BindBreak(brk),
         ContinueStatementSyntax cont => BindContinue(cont),
         ThrowStatementSyntax thr => BindThrow(thr),
+        SwitchStatementSyntax switchStatement => BindSwitchStatement(switchStatement),
+
+        // BindStatementList takes these out of the list, so reaching here means one was written
+        // where no list exists — as the body of an if or a loop.
+        LocalFunctionStatementSyntax function => Unreachable(function),
         TryStatementSyntax tri => BindTry(tri),
         ErrorStatementSyntax => new BoundNop(syntax.Position),
         _ => new BoundNop(syntax.Position),
     };
+
+    private BoundStatement Unreachable(LocalFunctionStatementSyntax syntax)
+    {
+        _diagnostics.Report(ErrorCode.ConstructNotSupported, syntax.Position,
+            $"局部函数 '{syntax.Name}' 只能声明在语句块中。");
+        return new BoundNop(syntax.Position);
+    }
 
     private readonly record struct ScopeState(Scope Scope, ClosureScope Closure);
 
@@ -184,7 +197,7 @@ internal sealed partial class Binder
         var saved = PushScope();
         var closure = _closureScope;
 
-        var statements = syntax.Statements.Select(BindStatement).ToArray();
+        var statements = BindStatementList(syntax.Statements, (statement, _) => BindStatement(statement));
 
         PopScope(saved);
         return new BoundBlock(syntax.Position, statements, closure.IsMaterialized ? closure : null);
@@ -202,6 +215,15 @@ internal sealed partial class Binder
                 BindIncrementAsStatement(prefix.Operand, prefix.Operator, syntax.Position),
             _ => BindExpression(syntax.Expression),
         };
+
+        // Nothing gives an untyped expression a type in statement position, and the emitter
+        // has no way to produce code for one.
+        if (Conversions.IsUntyped(expression.Type))
+        {
+            _diagnostics.Report(ErrorCode.CannotInferType, syntax.Position,
+                "该表达式需要一个目标类型，不能单独作为语句。");
+            return new BoundNop(syntax.Position);
+        }
 
         return new BoundExpressionStatement(syntax.Position, expression);
     }
@@ -222,14 +244,26 @@ internal sealed partial class Binder
 
             if (declaredType is null)
             {
-                if (initializer.Type == Conversions.LambdaType)
+                if (initializer is BoundUnboundLambda unbound)
+                {
+                    declaredType = NaturalDelegateType(unbound.Syntax);
+
+                    if (declaredType is null)
+                    {
+                        _diagnostics.Report(ErrorCode.CannotInferType, syntax.Position,
+                            $"无法从 lambda 推断 'var {syntax.Name}' 的类型。请写出每个参数的类型" +
+                            $"（例如 (int x) => ...），或者写出委托类型 Func<int, int> {syntax.Name} = ...。");
+                        declaredType = typeof(object);
+                    }
+                }
+                else if (initializer.Type == Conversions.CollectionType)
                 {
                     _diagnostics.Report(ErrorCode.CannotInferType, syntax.Position,
-                        $"无法从 lambda 推断 'var {syntax.Name}' 的类型。请写出委托类型，" +
-                        $"例如 Func<int, int> {syntax.Name} = ...。");
+                        $"无法从集合表达式推断 'var {syntax.Name}' 的类型。请写出目标类型，" +
+                        $"例如 int[] {syntax.Name} = [1, 2, 3];。");
                     declaredType = typeof(object);
                 }
-                else if (initializer.Type == Conversions.NullLiteralType || initializer.Type == typeof(void))
+                else if (Conversions.IsUntyped(initializer.Type) || initializer.Type == typeof(void))
                 {
                     _diagnostics.Report(ErrorCode.CannotInferType, syntax.Position,
                         $"无法从初始值推断 'var {syntax.Name}' 的类型。");
@@ -377,9 +411,10 @@ internal sealed partial class Binder
 
     private BoundStatement BindBreak(BreakStatementSyntax syntax)
     {
-        if (_loopDepth == 0)
+        if (_loopDepth == 0 && _switchDepth == 0)
         {
-            _diagnostics.Report(ErrorCode.BreakOutsideLoop, syntax.Position, "'break' 只能出现在循环中。");
+            _diagnostics.Report(ErrorCode.BreakOutsideLoop, syntax.Position,
+                "'break' 只能出现在循环或 switch 语句中。");
             return new BoundNop(syntax.Position);
         }
         return new BoundBreak(syntax.Position);
@@ -744,6 +779,7 @@ internal sealed partial class Binder
     private static bool AlwaysReturns(BoundStatement statement) => statement switch
     {
         BoundReturn => true,
+        BoundBreakScope scope => AlwaysReturns(scope.Body),
         BoundThrow => true,
         BoundBlock block => block.Statements.Any(AlwaysReturns),
         BoundIf { Else: not null } conditional =>
@@ -758,6 +794,8 @@ internal sealed partial class Binder
 
     private static bool ContainsBreak(BoundStatement statement) => statement switch
     {
+        // A break inside a switch leaves the switch, not the enclosing loop.
+        BoundBreakScope => false,
         BoundBreak => true,
         BoundBlock block => block.Statements.Any(ContainsBreak),
         BoundIf conditional => ContainsBreak(conditional.Then) ||

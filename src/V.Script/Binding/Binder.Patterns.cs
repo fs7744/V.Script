@@ -373,7 +373,7 @@ internal sealed partial class Binder
             resultType = next;
         }
 
-        if (resultType == Conversions.NullLiteralType || resultType == Conversions.LambdaType)
+        if (Conversions.IsUntyped(resultType))
         {
             return Fail(syntax.Position, ErrorCode.CannotInferType,
                 "无法推断 switch 表达式的结果类型。");

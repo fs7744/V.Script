@@ -58,6 +58,7 @@ public enum ErrorCode
     ContinueOutsideLoop = 3003,
     AwaitInExceptionHandler = 3004,
     NotAllCodePathsReturn = 3005,
+    SwitchSectionFallsThrough = 3006,
 
     // ---- 9xxx not implemented ----
     GenericMethodInferenceNotSupported = 9002,

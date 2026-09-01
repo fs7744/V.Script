@@ -129,7 +129,7 @@ public static class Conversions
             return IsNullAssignable(to) ? new Conversion(ConversionKind.ImplicitNullLiteral) : Conversion.None;
 
         // Lambdas are converted by the binder once a target delegate type is known, never here.
-        if (from == LambdaType || to == LambdaType) return Conversion.None;
+        if (IsUntyped(from) || IsUntyped(to)) return Conversion.None;
 
         if (to == typeof(void) || from == typeof(void)) return Conversion.None;
 
@@ -256,6 +256,88 @@ public static class Conversions
     public sealed class LambdaSentinel
     {
         private LambdaSentinel() { }
+    }
+
+    /// <summary>Sentinel for <c>[a, b, c]</c> before a target type is known.</summary>
+    public static readonly Type CollectionType = typeof(CollectionSentinel);
+
+    public sealed class CollectionSentinel
+    {
+        private CollectionSentinel() { }
+    }
+
+    /// <summary>Sentinel for the bare <c>default</c> literal.</summary>
+    public static readonly Type DefaultLiteralType = typeof(DefaultSentinel);
+
+    public sealed class DefaultSentinel
+    {
+        private DefaultSentinel() { }
+    }
+
+    /// <summary>Sentinel for a throw expression, which never produces a value at all.</summary>
+    public static readonly Type ThrowType = typeof(ThrowSentinel);
+
+    public sealed class ThrowSentinel
+    {
+        private ThrowSentinel() { }
+    }
+
+    /// <summary>
+    /// True for the expressions that have no type of their own until something gives them one:
+    /// <c>null</c>, a lambda, a collection expression, <c>default</c>, and a throw expression.
+    /// They can never be a <c>var</c> initializer or an inferred common type.
+    /// </summary>
+    public static bool IsUntyped(Type type) =>
+        type == NullLiteralType || type == LambdaType || type == CollectionType ||
+        type == DefaultLiteralType || type == ThrowType;
+
+    /// <summary>
+    /// True for the untyped forms that simply adopt whatever type the context wants, which is
+    /// what lets them sit opposite a typed branch in <c>?:</c> or <c>??</c>.
+    /// </summary>
+    public static bool AdoptsTargetType(Type type) =>
+        type == CollectionType || type == DefaultLiteralType || type == ThrowType;
+
+    /// <summary>
+    /// The interfaces a collection expression satisfies by building an array, in the order C#
+    /// lists them. An array implements all of them, so no wrapper type is needed.
+    /// </summary>
+    private static readonly Type[] ArrayBackedInterfaces =
+    [
+        typeof(IEnumerable<>), typeof(ICollection<>), typeof(IList<>),
+        typeof(IReadOnlyCollection<>), typeof(IReadOnlyList<>),
+    ];
+
+    /// <summary>
+    /// Can <c>[a, b, c]</c> become a <paramref name="target"/>? Either it is an array or one of
+    /// the interfaces an array implements, or it is a type that can be built up with
+    /// <c>Add</c> — the same shape a collection initializer needs.
+    /// </summary>
+    public static bool CouldBeCollection(Type target) => CollectionElementType(target) is not null;
+
+    /// <summary>The element type <paramref name="target"/> wants, or null when it is not a collection.</summary>
+    public static Type? CollectionElementType(Type target)
+    {
+        if (target.IsArray && target.GetArrayRank() == 1) return target.GetElementType();
+
+        if (target.IsGenericType && ArrayBackedInterfaces.Contains(target.GetGenericTypeDefinition()))
+            return target.GetGenericArguments()[0];
+
+        if (target.IsAbstract || target.IsInterface) return null;
+        if (target.GetConstructor(Type.EmptyTypes) is null) return null;
+        if (target.GetMethod("Add", BindingFlags.Public | BindingFlags.Instance) is null) return null;
+
+        return ElementTypeOf(target) ?? typeof(object);
+    }
+
+    /// <summary>The T of the first <c>IEnumerable&lt;T&gt;</c> a type implements.</summary>
+    private static Type? ElementTypeOf(Type type)
+    {
+        foreach (var candidate in type.GetInterfaces())
+            if (candidate.IsGenericType && candidate.GetGenericTypeDefinition() == typeof(IEnumerable<>))
+                return candidate.GetGenericArguments()[0];
+
+        return null;
     }
 
     public static bool IsDelegateType(Type type) =>

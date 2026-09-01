@@ -26,6 +26,26 @@ internal sealed partial class Binder
             return new BoundErrorExpression(position);
         }
 
+        // Both branches of `flag ? [1, 2] : []` are untyped, so the conditional itself is too.
+        // Pushing the target into the branches is what gives it a type.
+        if (expression is BoundConditional conditional && Conversions.AdoptsTargetType(conditional.Type))
+        {
+            return conditional with
+            {
+                Type = target,
+                WhenTrue = Convert(conditional.WhenTrue, target, position, explicitCast),
+                WhenFalse = Convert(conditional.WhenFalse, target, position, explicitCast),
+            };
+        }
+
+        // A throw expression produces no value, so it simply takes the type asked of it.
+        if (expression is BoundThrowExpression thrown) return thrown with { Type = target };
+
+        if (expression is BoundDefaultLiteral) return new BoundDefault(position, target);
+
+        if (expression is BoundUnboundCollection collection)
+            return BindCollectionExpression(collection.Syntax, target);
+
         if (expression is BoundNullLiteral)
         {
             if (Conversions.IsNullableValueType(target)) return new BoundDefault(position, target);

@@ -227,6 +227,10 @@ internal sealed partial class IlEmitter
                 EmitReturn(ret);
                 break;
 
+            case BoundBreakScope scope:
+                EmitBreakScope(scope);
+                break;
+
             case BoundBreak:
                 _il.Emit(OpCodes.Leave, _loops.Peek().Break);
                 break;
@@ -288,6 +292,22 @@ internal sealed partial class IlEmitter
             EmitStatement(statement.Else);
             _il.MarkLabel(endLabel);
         }
+    }
+
+    /// <summary>
+    /// Gives <c>break</c> somewhere to go without introducing a loop. The continue label is
+    /// inherited from the enclosing loop, so <c>continue</c> inside a switch still means the
+    /// loop — when there is no enclosing loop the binder has already rejected it.
+    /// </summary>
+    private void EmitBreakScope(BoundBreakScope scope)
+    {
+        var exit = _il.DefineLabel();
+        _loops.Push((exit, _loops.Count > 0 ? _loops.Peek().Continue : exit));
+
+        EmitStatement(scope.Body);
+
+        _il.MarkLabel(exit);
+        _loops.Pop();
     }
 
     private void EmitWhile(BoundWhile loop)

@@ -25,5 +25,10 @@ BenchmarkSwitcher
         typeof(AsyncBenchmarks),
         typeof(LambdaBenchmarks),
         typeof(PatternBenchmarks),
+        typeof(InterpolationBenchmarks),
+        typeof(InitializerBenchmarks),
+        typeof(LocalFunctionBenchmarks),
+        typeof(CarrierExecutionBenchmarks),
+        typeof(CarrierCompilationBenchmarks),
     ])
     .Run(args, config);

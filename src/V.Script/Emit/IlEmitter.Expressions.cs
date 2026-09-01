@@ -30,6 +30,8 @@ internal sealed partial class IlEmitter
             case BoundArrayAccess array: EmitArrayAccess(array); break;
             case BoundObjectCreation creation: EmitObjectCreation(creation); break;
             case BoundArrayCreation creation: EmitArrayCreation(creation); break;
+            case BoundNewArray creation: EmitNewArray(creation); break;
+            case BoundThrowExpression thrown: EmitThrowExpression(thrown); break;
             case BoundAwait await: EmitAwait(await); break;
             case BoundIsType isType: EmitIsType(isType); break;
             case BoundAsType asType: EmitAsType(asType); break;
@@ -41,6 +43,8 @@ internal sealed partial class IlEmitter
             case BoundErrorExpression:
             case BoundTypeReference:
             case BoundUnboundLambda:
+            case BoundUnboundCollection:
+            case BoundDefaultLiteral:
                 throw new InvalidOperationException("绑定失败的表达式不应到达发射阶段。");
 
             default:
@@ -866,6 +870,22 @@ internal sealed partial class IlEmitter
     {
         foreach (var argument in creation.Arguments) EmitExpression(argument);
         _il.Emit(OpCodes.Newobj, creation.Constructor);
+    }
+
+    /// <summary>
+    /// A throw expression leaves nothing behind. `throw` empties the evaluation stack, so the
+    /// branch it sits on simply never reaches the merge point the other branch does.
+    /// </summary>
+    private void EmitThrowExpression(BoundThrowExpression thrown)
+    {
+        EmitExpression(thrown.Exception);
+        _il.Emit(OpCodes.Throw);
+    }
+
+    private void EmitNewArray(BoundNewArray creation)
+    {
+        EmitExpression(creation.Length);
+        _il.Emit(OpCodes.Newarr, creation.ElementType);
     }
 
     private void EmitArrayCreation(BoundArrayCreation creation)

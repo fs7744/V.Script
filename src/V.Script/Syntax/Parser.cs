@@ -27,7 +27,7 @@ public sealed class Parser
         _diagnostics = diagnostics;
     }
 
-    private Token Current => Peek(0);
+    internal Token Current => Peek(0);
 
     private Token Peek(int offset)
     {
@@ -103,6 +103,7 @@ public sealed class Parser
             case SyntaxKind.ReturnKeyword: return ParseReturn();
             case SyntaxKind.TryKeyword: return ParseTry();
             case SyntaxKind.ThrowKeyword: return ParseThrow();
+            case SyntaxKind.SwitchKeyword: return ParseSwitchStatement();
             case SyntaxKind.BreakKeyword:
             {
                 var pos = Advance().Position;
@@ -288,6 +289,8 @@ public sealed class Parser
 
     private StatementSyntax ParseDeclarationOrExpressionStatement()
     {
+        if (TryParseLocalFunction(out var function)) return function!;
+
         if (TryParseVariableDeclaration(requireSemicolon: true, out var declaration))
             return declaration!;
 
@@ -554,8 +557,9 @@ public sealed class Parser
                 {
                     Advance();
                     var name = Expect(SyntaxKind.Identifier, "成员名");
+                    var typeArguments = TryParseCallTypeArguments();
                     expression = new MemberAccessExpressionSyntax(
-                        expression.Position, expression, name.Text, IsNullConditional: false);
+                        expression.Position, expression, name.Text, IsNullConditional: false, typeArguments);
                     break;
                 }
                 case SyntaxKind.QuestionDot when Current.Text == "?":
@@ -580,7 +584,9 @@ public sealed class Parser
                 {
                     Advance();
                     var args = ParseArguments();
-                    expression = new InvocationExpressionSyntax(expression.Position, expression, args);
+                    var typeArguments = (expression as MemberAccessExpressionSyntax)?.TypeArguments;
+                    expression = new InvocationExpressionSyntax(
+                        expression.Position, expression, args, typeArguments);
                     break;
                 }
                 case SyntaxKind.OpenBracket:
@@ -798,6 +804,82 @@ public sealed class Parser
         return new PropertyPatternSyntax(pos, type, subpatterns, designation);
     }
 
+    private ExpressionSyntax ParseCollectionExpression(SourcePosition pos)
+    {
+        Expect(SyntaxKind.OpenBracket, "'['");
+
+        var elements = new List<ExpressionSyntax>();
+        while (Current.Kind is not (SyntaxKind.CloseBracket or SyntaxKind.EndOfFile))
+        {
+            elements.Add(ParseExpression());
+            if (!Match(SyntaxKind.Comma)) break;
+        }
+
+        Expect(SyntaxKind.CloseBracket, "']'");
+        return new CollectionExpressionSyntax(pos, elements);
+    }
+
+    /// <summary>
+    /// <c>switch (x) { case P when G: ... default: ... }</c>. A section runs until the next
+    /// label or the closing brace; whether it may fall out of the bottom is the binder's call.
+    /// </summary>
+    private StatementSyntax ParseSwitchStatement()
+    {
+        var pos = Advance().Position; // 'switch'
+
+        Expect(SyntaxKind.OpenParen, "'('");
+        var governing = ParseExpression();
+        Expect(SyntaxKind.CloseParen, "')'");
+        Expect(SyntaxKind.OpenBrace, "'{'");
+
+        var sections = new List<SwitchSectionSyntax>();
+
+        while (Current.Kind is SyntaxKind.CaseKeyword or SyntaxKind.DefaultKeyword)
+        {
+            var sectionPosition = Current.Position;
+            var labels = new List<SwitchLabelSyntax>();
+
+            while (Current.Kind is SyntaxKind.CaseKeyword or SyntaxKind.DefaultKeyword)
+            {
+                var labelPosition = Current.Position;
+
+                if (Match(SyntaxKind.DefaultKeyword))
+                {
+                    Expect(SyntaxKind.Colon, "':'");
+                    labels.Add(new SwitchLabelSyntax(labelPosition, null, null));
+                    continue;
+                }
+
+                Advance(); // 'case'
+                var pattern = ParsePattern();
+
+                ExpressionSyntax? guard = null;
+                if (IsContextual("when"))
+                {
+                    Advance();
+                    guard = ParseExpression();
+                }
+
+                Expect(SyntaxKind.Colon, "':'");
+                labels.Add(new SwitchLabelSyntax(labelPosition, pattern, guard));
+            }
+
+            var statements = new List<StatementSyntax>();
+            while (Current.Kind is not (SyntaxKind.CaseKeyword or SyntaxKind.DefaultKeyword
+                                        or SyntaxKind.CloseBrace or SyntaxKind.EndOfFile))
+            {
+                var before = _pos;
+                statements.Add(ParseStatement());
+                if (_pos == before) Advance();
+            }
+
+            sections.Add(new SwitchSectionSyntax(sectionPosition, labels, statements));
+        }
+
+        Expect(SyntaxKind.CloseBrace, "'}'");
+        return new SwitchStatementSyntax(pos, governing, sections);
+    }
+
     private ExpressionSyntax ParseSwitchExpression(ExpressionSyntax governing)
     {
         var pos = Advance().Position; // 'switch'
@@ -859,18 +941,51 @@ public sealed class Parser
             {
                 // single-parameter lambda: x => ...
                 if (Peek(1).Kind == SyntaxKind.Arrow)
-                    return ParseLambda([Advance().Text], skipParen: false);
+                {
+                    var parameterToken = Advance();
+                    return ParseLambda(
+                        [new LambdaParameterSyntax(parameterToken.Position, null, parameterToken.Text)],
+                        skipParen: false);
+                }
+
+                // Unlike C#, `nameof` in call position always means the operator — a global
+                // or local of that name cannot be invoked. Reading it as a value still works.
+                if (Current.Text == "nameof" && Peek(1).Kind == SyntaxKind.OpenParen)
+                {
+                    Advance();
+                    Advance();
+                    var operand = ParseExpression();
+                    Expect(SyntaxKind.CloseParen, "')'");
+                    return new NameOfExpressionSyntax(pos, operand);
+                }
 
                 return new NameExpressionSyntax(pos, Advance().Text);
             }
 
             case SyntaxKind.NewKeyword:
+                return ParseObjectOrArrayCreation(pos);
+
+            case SyntaxKind.InterpolatedStringLiteral:
+                return ParseInterpolatedString(Advance());
+
+            case SyntaxKind.OpenBracket:
+                return ParseCollectionExpression(pos);
+
+            case SyntaxKind.ThrowKeyword:
+                Advance();
+                return new ThrowExpressionSyntax(pos, ParseExpression());
+
+            case SyntaxKind.DefaultKeyword:
             {
                 Advance();
+                if (Current.Kind != SyntaxKind.OpenParen) return new DefaultExpressionSyntax(pos, null);
+
+                Advance();
                 var type = ParseType();
-                var args = Match(SyntaxKind.OpenParen) ? ParseArguments() : [];
-                return new ObjectCreationExpressionSyntax(pos, type, args);
+                Expect(SyntaxKind.CloseParen, "')'");
+                return new DefaultExpressionSyntax(pos, type);
             }
+
 
             case SyntaxKind.TypeofKeyword:
             {
@@ -891,6 +1006,175 @@ public sealed class Parser
         }
     }
 
+    /// <summary>
+    /// Distinguishes <c>new T(...)</c>, <c>new T { ... }</c>, <c>new T[n]</c>,
+    /// <c>new T[] { ... }</c> and <c>new[] { ... }</c>.
+    /// </summary>
+    private ExpressionSyntax ParseObjectOrArrayCreation(SourcePosition pos)
+    {
+        Advance(); // 'new'
+
+        // new[] { ... } — element type comes from the elements.
+        if (Current.Kind == SyntaxKind.OpenBracket)
+        {
+            Advance();
+            Expect(SyntaxKind.CloseBracket, "']'");
+            return new ArrayCreationExpressionSyntax(pos, null, null, ParseArrayElements());
+        }
+
+        var type = ParseType();
+
+        // new T[length] — ParseType only consumes empty '[]' pairs, so a sized rank is still here.
+        if (Current.Kind == SyntaxKind.OpenBracket)
+        {
+            Advance();
+            var length = ParseExpression();
+            Expect(SyntaxKind.CloseBracket, "']'");
+            return new ArrayCreationExpressionSyntax(pos, type, length, null);
+        }
+
+        // new T[] { ... }
+        if (type.ArrayRank > 0 && Current.Kind == SyntaxKind.OpenBrace)
+        {
+            var elementType = type with { ArrayRank = type.ArrayRank - 1 };
+            return new ArrayCreationExpressionSyntax(pos, elementType, null, ParseArrayElements());
+        }
+
+        var arguments = Match(SyntaxKind.OpenParen) ? ParseArguments() : [];
+        var initializer = Current.Kind == SyntaxKind.OpenBrace ? ParseInitializer() : null;
+
+        return new ObjectCreationExpressionSyntax(pos, type, arguments, initializer);
+    }
+
+    private List<ExpressionSyntax> ParseArrayElements()
+    {
+        Expect(SyntaxKind.OpenBrace, "'{'");
+
+        var elements = new List<ExpressionSyntax>();
+        while (Current.Kind is not (SyntaxKind.CloseBrace or SyntaxKind.EndOfFile))
+        {
+            elements.Add(ParseExpression());
+            if (!Match(SyntaxKind.Comma)) break;
+        }
+
+        Expect(SyntaxKind.CloseBrace, "'}'");
+        return elements;
+    }
+
+    /// <summary>
+    /// An initializer is a member list when it starts with <c>Name =</c>, and an element list
+    /// otherwise. An empty <c>{ }</c> is treated as a member list, which behaves identically.
+    /// </summary>
+    private InitializerSyntax ParseInitializer()
+    {
+        var pos = Expect(SyntaxKind.OpenBrace, "'{'").Position;
+
+        var isMemberList = Current.Kind == SyntaxKind.CloseBrace ||
+                           (Current.Kind == SyntaxKind.Identifier && Peek(1).Kind == SyntaxKind.Equals);
+
+        if (isMemberList)
+        {
+            var members = new List<MemberInitializerSyntax>();
+
+            while (Current.Kind is not (SyntaxKind.CloseBrace or SyntaxKind.EndOfFile))
+            {
+                var memberPos = Current.Position;
+                var name = Expect(SyntaxKind.Identifier, "成员名").Text;
+                Expect(SyntaxKind.Equals, "'='");
+                members.Add(new MemberInitializerSyntax(memberPos, name, ParseExpression()));
+
+                if (!Match(SyntaxKind.Comma)) break;
+            }
+
+            Expect(SyntaxKind.CloseBrace, "'}'");
+            return new ObjectInitializerSyntax(pos, members);
+        }
+
+        var elements = new List<ExpressionSyntax>();
+        while (Current.Kind is not (SyntaxKind.CloseBrace or SyntaxKind.EndOfFile))
+        {
+            elements.Add(ParseExpression());
+            if (!Match(SyntaxKind.Comma)) break;
+        }
+
+        Expect(SyntaxKind.CloseBrace, "'}'");
+        return new CollectionInitializerSyntax(pos, elements);
+    }
+
+    /// <summary>
+    /// Speculatively reads <c>&lt;T, U&gt;</c> when it is immediately followed by <c>(</c>,
+    /// which is what separates a type-argument list from a chain of comparisons.
+    /// </summary>
+    private List<TypeSyntax>? TryParseCallTypeArguments()
+    {
+        if (Current.Kind != SyntaxKind.Less) return null;
+
+        var start = _pos;
+        var errors = _diagnostics.Count;
+        Advance();
+
+        var arguments = new List<TypeSyntax>();
+        while (true)
+        {
+            var argument = ParseType(speculative: true);
+            if (argument is null) { _pos = start; return null; }
+
+            arguments.Add(argument);
+            if (Match(SyntaxKind.Comma)) continue;
+            break;
+        }
+
+        if (_diagnostics.Count != errors ||
+            !Match(SyntaxKind.Greater) ||
+            Current.Kind != SyntaxKind.OpenParen)
+        {
+            _pos = start;
+            return null;
+        }
+
+        return arguments;
+    }
+
+    /// <summary>
+    /// Turns the lexer's raw parts into an expression tree. Each hole is parsed with its own
+    /// lexer seeded at the hole's position, so errors inside it report real coordinates.
+    /// </summary>
+    private ExpressionSyntax ParseInterpolatedString(Token token)
+    {
+        var raw = (IReadOnlyList<RawInterpolationPart>)token.Value!;
+        var parts = new List<InterpolationPartSyntax>(raw.Count);
+
+        foreach (var part in raw)
+        {
+            if (!part.IsHole)
+            {
+                parts.Add(new InterpolationPartSyntax(part.Position, part.Text, null, null, null));
+                continue;
+            }
+
+            if (string.IsNullOrWhiteSpace(part.Text))
+            {
+                _diagnostics.Report(ErrorCode.ExpectedExpression, part.Position, "插值项为空。");
+                continue;
+            }
+
+            var tokens = new Lexer(part.Text, _diagnostics, part.Position).Tokenize();
+            var inner = new Parser(tokens, _diagnostics);
+            var value = inner.ParseExpression();
+
+            if (inner.Current.Kind != SyntaxKind.EndOfFile)
+            {
+                _diagnostics.Report(ErrorCode.UnexpectedToken, inner.Current.Position,
+                    $"插值项中有多余内容 '{Describe(inner.Current)}'。");
+            }
+
+            parts.Add(new InterpolationPartSyntax(
+                part.Position, null, value, part.Alignment?.Trim(), part.Format));
+        }
+
+        return new InterpolatedStringExpressionSyntax(token.Position, parts);
+    }
+
     private ExpressionSyntax ParseParenthesized(SourcePosition pos)
     {
         if (TryParseParenthesizedLambda(pos, out var lambda)) return lambda!;
@@ -907,13 +1191,14 @@ public sealed class Parser
         var start = _pos;
         Advance(); // '('
 
-        var parameters = new List<string>();
+        var parameters = new List<LambdaParameterSyntax>();
         if (Current.Kind != SyntaxKind.CloseParen)
         {
             while (true)
             {
-                if (Current.Kind != SyntaxKind.Identifier) { _pos = start; result = null; return false; }
-                parameters.Add(Advance().Text);
+                if (!TryParseLambdaParameter(out var parameter)) { _pos = start; result = null; return false; }
+
+                parameters.Add(parameter!);
                 if (Match(SyntaxKind.Comma)) continue;
                 break;
             }
@@ -931,7 +1216,99 @@ public sealed class Parser
         return true;
     }
 
-    private ExpressionSyntax ParseLambda(IReadOnlyList<string> parameters, bool skipParen)
+    /// <summary>
+    /// A lambda parameter is <c>name</c> or <c>Type name</c>. The type is tried first, and only
+    /// kept when a name actually follows it — otherwise <c>(a, b)</c> would read <c>a</c> as a type.
+    /// </summary>
+    private bool TryParseLambdaParameter(out LambdaParameterSyntax? parameter)
+    {
+        var position = Current.Position;
+        var start = _pos;
+
+        if (Current.Kind == SyntaxKind.Identifier && TrySpeculateType(out var type) &&
+            Current.Kind == SyntaxKind.Identifier)
+        {
+            parameter = new LambdaParameterSyntax(position, type, Advance().Text);
+            return true;
+        }
+
+        _pos = start;
+
+        if (Current.Kind != SyntaxKind.Identifier)
+        {
+            parameter = null;
+            return false;
+        }
+
+        parameter = new LambdaParameterSyntax(position, null, Advance().Text);
+        return true;
+    }
+
+    /// <summary>
+    /// Speculatively parses <c>ReturnType Name(Type p, ...) body</c>. Local functions are the
+    /// only statement that starts with a type and reaches an open paren.
+    /// </summary>
+    private bool TryParseLocalFunction(out StatementSyntax? result)
+    {
+        var start = _pos;
+        var pos = Current.Position;
+
+        result = null;
+        if (Current.Kind != SyntaxKind.Identifier) return false;
+
+        var isVoid = Current.Text == "void" && Peek(1).Kind == SyntaxKind.Identifier;
+
+        TypeSyntax? returnType = null;
+        if (isVoid) Advance();
+        else if (!TrySpeculateType(out returnType)) { _pos = start; return false; }
+
+        if (Current.Kind != SyntaxKind.Identifier || Peek(1).Kind != SyntaxKind.OpenParen)
+        {
+            _pos = start;
+            return false;
+        }
+
+        var name = Advance().Text;
+        Advance(); // '('
+
+        var parameters = new List<LambdaParameterSyntax>();
+        while (Current.Kind is not (SyntaxKind.CloseParen or SyntaxKind.EndOfFile))
+        {
+            var parameterPosition = Current.Position;
+
+            if (!TrySpeculateType(out var parameterType) || Current.Kind != SyntaxKind.Identifier)
+            {
+                _pos = start;
+                return false;
+            }
+
+            parameters.Add(new LambdaParameterSyntax(parameterPosition, parameterType, Advance().Text));
+            if (!Match(SyntaxKind.Comma)) break;
+        }
+
+        if (!Match(SyntaxKind.CloseParen)) { _pos = start; return false; }
+
+        SyntaxNode body;
+        if (Current.Kind == SyntaxKind.OpenBrace)
+        {
+            body = ParseBlock();
+        }
+        else if (Match(SyntaxKind.Arrow))
+        {
+            body = ParseExpression();
+            ExpectStatementEnd();
+        }
+        else
+        {
+            _pos = start;
+            return false;
+        }
+
+        result = new LocalFunctionStatementSyntax(pos, returnType, name, parameters, body);
+        return true;
+    }
+
+    private ExpressionSyntax ParseLambda(IReadOnlyList<LambdaParameterSyntax> parameters, bool skipParen)
     {
         _ = skipParen;
         var pos = Current.Position;

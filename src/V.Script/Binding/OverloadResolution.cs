@@ -230,6 +230,13 @@ public static class OverloadResolution
                 if (invoke.GetParameters().Length != argument.LambdaArity) return false;
                 if (invoke.GetParameters().Any(p => p.ParameterType.IsByRef)) return false;
             }
+            else if (Conversions.AdoptsTargetType(argument.Type))
+            {
+                // `default` and a throw expression fit anything; a collection expression only
+                // fits something that can actually be built out of elements.
+                if (argument.Type == Conversions.CollectionType &&
+                    !Conversions.CouldBeCollection(parameterType)) return false;
+            }
             else if (!Conversions.Classify(argument.Type, parameterType).IsImplicit)
             {
                 return false;

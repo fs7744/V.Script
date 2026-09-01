@@ -216,6 +216,14 @@ public sealed record BoundObjectCreation(
     ConstructorInfo Constructor,
     IReadOnlyList<BoundExpression> Arguments) : BoundExpression(Position, Constructor.DeclaringType!);
 
+/// <summary>
+/// <c>new T[n]</c>. The elements are the type's default, which is what <c>newarr</c> gives.
+/// </summary>
+public sealed record BoundNewArray(
+    SourcePosition Position,
+    Type ElementType,
+    BoundExpression Length) : BoundExpression(Position, ElementType.MakeArrayType());
+
 public sealed record BoundArrayCreation(
     SourcePosition Position,
     Type ElementType,
@@ -259,6 +267,27 @@ public sealed record BoundSequence(
     Type Type,
     IReadOnlyList<BoundExpression> SideEffects,
     BoundExpression Value) : BoundExpression(Position, Type);
+
+/// <summary>
+/// A collection expression before a target type is known. Which collection it becomes — an
+/// array, a <c>List&lt;T&gt;</c>, an interface — is decided entirely by the conversion.
+/// </summary>
+public sealed record BoundUnboundCollection(
+    SourcePosition Position,
+    Syntax.CollectionExpressionSyntax Syntax) : BoundExpression(Position, Conversions.CollectionType);
+
+/// <summary>The bare <c>default</c> literal; <c>default(T)</c> binds straight to BoundDefault.</summary>
+public sealed record BoundDefaultLiteral(SourcePosition Position)
+    : BoundExpression(Position, Conversions.DefaultLiteralType);
+
+/// <summary>
+/// <c>throw e</c> in expression position. It yields no value, so <see cref="BoundExpression.Type"/>
+/// is whatever the context asks for — the emitter never leaves anything on the stack for it.
+/// </summary>
+public sealed record BoundThrowExpression(
+    SourcePosition Position,
+    Type Type,
+    BoundExpression Exception) : BoundExpression(Position, Type);
 
 /// <summary>
 /// A lambda before a target type is known. C# anonymous functions have no type of their own, so
@@ -351,6 +380,13 @@ public sealed record BoundReturn(SourcePosition Position, BoundExpression? Expre
     : BoundStatement(Position);
 
 public sealed record BoundBreak(SourcePosition Position) : BoundStatement(Position);
+
+/// <summary>
+/// A region that <c>break</c> leaves. A <c>switch</c> lowers to one of these wrapped around an
+/// if/else chain; <c>continue</c> inside it still belongs to the enclosing loop.
+/// </summary>
+public sealed record BoundBreakScope(SourcePosition Position, BoundStatement Body)
+    : BoundStatement(Position);
 
 public sealed record BoundContinue(SourcePosition Position) : BoundStatement(Position);
 
