@@ -91,55 +91,95 @@ internal sealed partial class Binder
 
         var effects = new List<BoundExpression> { new BoundAssignment(position, target, creation) };
 
+        if (!ApplyInitializer(target, syntax, effects))
+            return new BoundErrorExpression(position);
+
+        return new BoundSequence(position, creation.Type, effects, target);
+    }
+
+    /// <summary>
+    /// Appends the writes an initializer performs on an existing value. Nested initializers use
+    /// the same entry point against the member they belong to, which is what makes
+    /// <c>new A { Inner = { X = 1 } }</c> write into the object <c>Inner</c> already holds.
+    /// </summary>
+    private bool ApplyInitializer(BoundExpression target, InitializerSyntax syntax, List<BoundExpression> effects)
+    {
         switch (syntax)
         {
             case ObjectInitializerSyntax members:
                 foreach (var member in members.Members)
-                {
-                    var assignment = BindMemberInitializer(target, member);
-                    if (assignment is BoundErrorExpression error) return error;
-                    effects.Add(assignment);
-                }
-                break;
+                    if (!BindMemberInitializer(target, member, effects))
+                        return false;
+
+                return true;
 
             case CollectionInitializerSyntax elements:
                 foreach (var element in elements.Elements)
                 {
                     var argument = BindExpression(element);
-                    if (argument is BoundErrorExpression) return argument;
+                    if (argument is BoundErrorExpression) return false;
 
                     var add = BindAddCall(target, argument, element.Position);
-                    if (add is BoundErrorExpression error) return error;
+                    if (add is BoundErrorExpression) return false;
+
                     effects.Add(add);
                 }
-                break;
-        }
 
-        return new BoundSequence(position, creation.Type, effects, target);
+                return true;
+
+            default:
+                return true;
+        }
     }
 
-    private BoundExpression BindMemberInitializer(BoundExpression target, MemberInitializerSyntax syntax)
+    private bool BindMemberInitializer(
+        BoundExpression target,
+        MemberInitializerSyntax syntax,
+        List<BoundExpression> effects)
     {
-        var access = BindInstanceMember(syntax.Position, target, syntax.Name);
-        if (access is BoundErrorExpression) return access;
+        var access = syntax.Name is not null
+            ? BindInstanceMember(syntax.Position, target, syntax.Name)
+            : BindIndexAccess(target, syntax.Index!, syntax.Position);
+
+        if (access is BoundErrorExpression) return false;
+
+        // A nested initializer reads the member instead of assigning it.
+        if (syntax.Nested is not null)
+        {
+            var inner = access;
+
+            if (!IsRepeatable(inner))
+            {
+                var temp = MakeTemp(inner.Type);
+                var slot = new BoundLocalAccess(syntax.Position, temp);
+                effects.Add(new BoundAssignment(syntax.Position, slot, inner));
+                inner = slot;
+            }
+
+            return ApplyInitializer(inner, syntax.Nested, effects);
+        }
+
+        var described = syntax.Name ?? "索引";
 
         if (access is BoundPropertyAccess { Property.SetMethod: null })
         {
-            return Fail(syntax.Position, ErrorCode.PropertyHasNoSetter,
-                $"属性 '{syntax.Name}' 没有 set 访问器。");
+            Fail(syntax.Position, ErrorCode.PropertyHasNoSetter, $"属性 '{described}' 没有 set 访问器。");
+            return false;
         }
 
         if (!IsAssignable(access))
         {
-            return Fail(syntax.Position, ErrorCode.NotAssignable,
-                $"'{syntax.Name}' 是只读的，不能在对象初始化器中赋值。");
+            Fail(syntax.Position, ErrorCode.NotAssignable, $"'{described}' 是只读的，不能在对象初始化器中赋值。");
+            return false;
         }
 
-        var value = BindExpression(syntax.Value);
-        if (value is BoundErrorExpression) return value;
+        var value = BindExpression(syntax.Value!);
+        if (value is BoundErrorExpression) return false;
 
-        return new BoundAssignment(syntax.Position, access,
-            Convert(value, access.Type, syntax.Position, explicitCast: false));
+        effects.Add(new BoundAssignment(syntax.Position, access,
+            Convert(value, access.Type, syntax.Position, explicitCast: false)));
+
+        return true;
     }
 
     /// <summary>
@@ -156,7 +196,7 @@ internal sealed partial class Binder
         }
 
         BoundExpression[] bound = [argument];
-        var infos = new[] { Describe(argument, null) };
+        var infos = new[] { Describe(argument, (string?)null) };
         var resolution = OverloadResolution.Resolve(methods, infos, (i, types) => ProbeLambdaReturn(bound, i, types));
 
         if (resolution.Outcome != OverloadOutcome.Resolved || resolution.Best!.Method.IsStatic)
@@ -187,7 +227,10 @@ internal sealed partial class Binder
                 "目标需要是数组、数组能满足的接口，或者可以无参构造并 Add 的类型。");
         }
 
-        var elements = syntax.Elements.Select(BindExpression).ToArray();
+        if (syntax.Elements.Any(e => e.IsSpread))
+            return BindSpreadCollection(syntax, target, elementType);
+
+        var elements = syntax.Elements.Select(e => BindExpression(e.Value)).ToArray();
         if (elements.Any(e => e is BoundErrorExpression)) return new BoundErrorExpression(syntax.Position);
 
         var array = MakeArray(syntax.Position, elementType, elements);
@@ -214,6 +257,90 @@ internal sealed partial class Binder
         }
 
         return new BoundSequence(syntax.Position, target, effects, receiver);
+    }
+
+    /// <summary>
+    /// With a spread the final length is only known at run time, so the elements are collected
+    /// into a <c>List&lt;T&gt;</c> and handed to the target from there. That costs one extra copy
+    /// against C#'s length-counting lowering, and is what buys arbitrary spreads.
+    /// </summary>
+    private BoundExpression BindSpreadCollection(
+        CollectionExpressionSyntax syntax,
+        Type target,
+        Type elementType)
+    {
+        var position = syntax.Position;
+        var listType = typeof(List<>).MakeGenericType(elementType);
+
+        var temp = MakeTemp(listType);
+        var builder = new BoundLocalAccess(position, temp);
+
+        var effects = new List<BoundExpression>
+        {
+            new BoundAssignment(position, builder,
+                new BoundObjectCreation(position, listType.GetConstructor(Type.EmptyTypes)!, [])),
+        };
+
+        var addRange = listType.GetMethod("AddRange", [typeof(IEnumerable<>).MakeGenericType(elementType)])!;
+
+        foreach (var element in syntax.Elements)
+        {
+            var value = BindExpression(element.Value);
+            if (value is BoundErrorExpression) return value;
+
+            if (!element.IsSpread)
+            {
+                var add = BindAddCall(builder, value, element.Position);
+                if (add is BoundErrorExpression) return add;
+
+                effects.Add(add);
+                continue;
+            }
+
+            var sequence = typeof(IEnumerable<>).MakeGenericType(elementType);
+            if (!sequence.IsAssignableFrom(value.Type))
+            {
+                return Fail(element.Position, ErrorCode.CannotConvert,
+                    $"'..' 的操作数必须是 {TypeResolver.Display(sequence)}，" +
+                    $"实际为 {TypeResolver.Display(value.Type)}。");
+            }
+
+            effects.Add(new BoundCall(element.Position, builder, addRange,
+                [Convert(value, sequence, element.Position, explicitCast: false)]));
+        }
+
+        if (listType == target || target.IsAssignableFrom(listType))
+            return new BoundSequence(position, target, effects, Convert(builder, target, position, explicitCast: false));
+
+        if (target.IsArray)
+        {
+            var toArray = listType.GetMethod("ToArray", Type.EmptyTypes)!;
+            return new BoundSequence(position, target, effects,
+                new BoundCall(position, builder, toArray, []));
+        }
+
+        // Some other collection type: build it from the list through its Add method.
+        var result = MakeTemp(target);
+        var receiver = new BoundLocalAccess(position, result);
+
+        effects.Add(new BoundAssignment(position, receiver,
+            new BoundObjectCreation(position, target.GetConstructor(Type.EmptyTypes)!, [])));
+
+        var toArrayMethod = listType.GetMethod("ToArray", Type.EmptyTypes)!;
+        var addRangeOnTarget = target.GetMethod("AddRange", [typeof(IEnumerable<>).MakeGenericType(elementType)]);
+
+        if (addRangeOnTarget is not null)
+        {
+            effects.Add(new BoundCall(position, receiver, addRangeOnTarget,
+                [Convert(builder, typeof(IEnumerable<>).MakeGenericType(elementType), position, explicitCast: false)]));
+
+            return new BoundSequence(position, target, effects, receiver);
+        }
+
+        _ = toArrayMethod;
+
+        return Fail(position, ErrorCode.ConstructNotSupported,
+            $"{TypeResolver.Display(target)} 没有 AddRange，不能用带 '..' 的集合表达式构造。");
     }
 
     // ============================================================ default, throw, nameof
@@ -287,17 +414,22 @@ internal sealed partial class Binder
 
     private BoundExpression BindArrayCreation(ArrayCreationExpressionSyntax syntax)
     {
-        // new T[length]
-        if (syntax.Length is not null)
+        // new T[a, b]
+        if (syntax.Lengths is not null)
         {
             var elementType = ResolveType(syntax.ElementType!);
             if (elementType is null) return new BoundErrorExpression(syntax.Position);
 
-            var length = BindExpression(syntax.Length);
-            if (length is BoundErrorExpression) return length;
+            var lengths = new BoundExpression[syntax.Lengths.Count];
+            for (var i = 0; i < lengths.Length; i++)
+            {
+                var length = BindExpression(syntax.Lengths[i]);
+                if (length is BoundErrorExpression) return length;
 
-            return new BoundNewArray(syntax.Position, elementType,
-                Convert(length, typeof(int), syntax.Position, explicitCast: false));
+                lengths[i] = Convert(length, typeof(int), syntax.Position, explicitCast: false);
+            }
+
+            return new BoundNewArray(syntax.Position, elementType, lengths);
         }
 
         var elements = syntax.Elements!.Select(BindExpression).ToArray();

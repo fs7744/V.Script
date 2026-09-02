@@ -41,6 +41,16 @@ public sealed class Lexer
             ["switch"] = SyntaxKind.SwitchKeyword,
             ["case"] = SyntaxKind.CaseKeyword,
             ["default"] = SyntaxKind.DefaultKeyword,
+            ["ref"] = SyntaxKind.RefKeyword,
+            ["out"] = SyntaxKind.OutKeyword,
+            ["checked"] = SyntaxKind.CheckedKeyword,
+            ["unchecked"] = SyntaxKind.UncheckedKeyword,
+            ["using"] = SyntaxKind.UsingKeyword,
+            ["lock"] = SyntaxKind.LockKeyword,
+            ["goto"] = SyntaxKind.GotoKeyword,
+            ["const"] = SyntaxKind.ConstKeyword,
+            ["static"] = SyntaxKind.StaticKeyword,
+            ["with"] = SyntaxKind.WithKeyword,
         }.ToFrozenDictionary(StringComparer.Ordinal);
 
     private static readonly SearchValues<char> DigitChars =
@@ -107,12 +117,19 @@ public sealed class Lexer
 
         var c = Current;
 
+        // The @"..." forms have to be recognised before @identifier.
+        if (c == '@' && Peek() == '"') return ReadVerbatimString(start);
+        if (c == '@' && Peek() == '$' && Peek(2) == '"') return ReadInterpolatedString(start, verbatim: true);
+        if (c == '$' && Peek() == '@' && Peek(2) == '"') return ReadInterpolatedString(start, verbatim: true);
+
         if (char.IsLetter(c) || c == '_' || c == '@')
             return ReadIdentifierOrKeyword(start);
 
         if (char.IsAsciiDigit(c) || (c == '.' && char.IsAsciiDigit(Peek())))
             return ReadNumber(start);
 
+        if (c == '$' && StartsRawInterpolation()) return ReadRawInterpolatedString(start);
+        if (c == '"' && Peek() == '"' && Peek(2) == '"') return ReadRawString(start);
         if (c == '$' && Peek() == '"') return ReadInterpolatedString(start);
 
         return c switch
@@ -363,6 +380,233 @@ public sealed class Lexer
         }
     }
 
+    /// <summary>
+    /// <c>@"..."</c>: no escapes, newlines allowed, and <c>""</c> is a single quote.
+    /// </summary>
+    private Token ReadVerbatimString(SourcePosition start)
+    {
+        var begin = _pos;
+        _pos += 2; // @"
+
+        var sb = new StringBuilder();
+
+        while (true)
+        {
+            if (_pos >= _text.Length)
+            {
+                _diagnostics.Report(ErrorCode.UnterminatedString, start, "逐字字符串未闭合。");
+                break;
+            }
+
+            if (Current == '"')
+            {
+                if (Peek() != '"') { _pos++; break; }
+
+                sb.Append('"');
+                _pos += 2;
+                continue;
+            }
+
+            if (Current == '\n') { _line++; _lineStart = _pos + 1; }
+
+            sb.Append(Current);
+            _pos++;
+        }
+
+        return new Token(SyntaxKind.StringLiteral, _text[begin.._pos], start, sb.ToString());
+    }
+
+    /// <summary>A run of <c>$</c> followed by at least three quotes.</summary>
+    private bool StartsRawInterpolation()
+    {
+        var at = _pos;
+        while (at < _text.Length && _text[at] == '$') at++;
+
+        return at + 2 < _text.Length &&
+               _text[at] == '"' && _text[at + 1] == '"' && _text[at + 2] == '"';
+    }
+
+    /// <summary>
+    /// <c>$$"""...{{hole}}..."""</c>. The number of <c>$</c> is the number of braces a hole
+    /// needs, which is what lets the text itself contain single braces untouched.
+    /// </summary>
+    private Token ReadRawInterpolatedString(SourcePosition start)
+    {
+        var begin = _pos;
+
+        var dollars = 0;
+        while (_pos < _text.Length && Current == '$') { dollars++; _pos++; }
+
+        var raw = ReadRawStringBody(start, out var ok);
+        if (!ok) return new Token(SyntaxKind.StringLiteral, _text[begin.._pos], start, string.Empty);
+
+        var normalised = NormaliseRaw(raw, start);
+        var parts = SplitRawInterpolation(normalised, start, dollars);
+
+        return new Token(SyntaxKind.InterpolatedStringLiteral, _text[begin.._pos], start, parts);
+    }
+
+    /// <summary>
+    /// Splits already-normalised raw text on runs of <paramref name="braces"/> braces. Positions
+    /// inside are approximate — a raw literal's content has been reindented, so there is no exact
+    /// mapping back to the file.
+    /// </summary>
+    private List<RawInterpolationPart> SplitRawInterpolation(string text, SourcePosition start, int braces)
+    {
+        var parts = new List<RawInterpolationPart>();
+        var literal = new StringBuilder();
+        var i = 0;
+
+        while (i < text.Length)
+        {
+            if (text[i] != '{' || !HasRun(text, i, '{', braces))
+            {
+                literal.Append(text[i]);
+                i++;
+                continue;
+            }
+
+            if (literal.Length > 0)
+            {
+                parts.Add(new RawInterpolationPart(IsHole: false, literal.ToString(), start));
+                literal.Clear();
+            }
+
+            i += braces;
+            var holeStart = i;
+
+            while (i < text.Length && !HasRun(text, i, '}', braces)) i++;
+
+            if (i >= text.Length)
+            {
+                _diagnostics.Report(ErrorCode.UnterminatedString, start, "插值项缺少结束的 '}'。");
+                break;
+            }
+
+            parts.Add(new RawInterpolationPart(IsHole: true, text[holeStart..i], start));
+            i += braces;
+        }
+
+        if (literal.Length > 0)
+            parts.Add(new RawInterpolationPart(IsHole: false, literal.ToString(), start));
+
+        return parts;
+    }
+
+    private static bool HasRun(string text, int at, char c, int count)
+    {
+        if (at + count > text.Length) return false;
+
+        for (var i = 0; i < count; i++)
+            if (text[at + i] != c)
+                return false;
+
+        return true;
+    }
+
+    /// <summary>
+    /// A raw string literal. The fence may be longer than three quotes; a multi-line one drops
+    /// the first and last newline and strips the indentation the closing fence sits at, which is
+    /// what lets an indented literal read as unindented text.
+    /// </summary>
+    private Token ReadRawString(SourcePosition start)
+    {
+        var begin = _pos;
+        var raw = ReadRawStringBody(start, out var ok);
+
+        return ok
+            ? new Token(SyntaxKind.StringLiteral, _text[begin.._pos], start, NormaliseRaw(raw, start))
+            : new Token(SyntaxKind.StringLiteral, _text[begin.._pos], start, string.Empty);
+    }
+
+    /// <summary>Consumes the fence, the content and the closing fence; returns the content.</summary>
+    private string ReadRawStringBody(SourcePosition start, out bool ok)
+    {
+        var fence = 0;
+        while (_pos < _text.Length && Current == '"') { fence++; _pos++; }
+
+        var contentStart = _pos;
+        var contentEnd = -1;
+
+        while (_pos < _text.Length)
+        {
+            if (Current != '"')
+            {
+                if (Current == '\n') { _line++; _lineStart = _pos + 1; }
+                _pos++;
+                continue;
+            }
+
+            var at = _pos;
+            var run = 0;
+            while (at < _text.Length && _text[at] == '"') { run++; at++; }
+
+            if (run >= fence)
+            {
+                // A longer run closes at its last `fence` quotes; the extra ones are content.
+                contentEnd = at - fence;
+                _pos = at;
+                break;
+            }
+
+            _pos = at;
+        }
+
+        if (contentEnd < 0)
+        {
+            _diagnostics.Report(ErrorCode.UnterminatedString, start, "原始字符串未闭合。");
+            _pos = _text.Length;
+            ok = false;
+            return string.Empty;
+        }
+
+        ok = true;
+        return _text[contentStart..contentEnd];
+    }
+
+    /// <summary>Applies the multi-line rules of a raw string literal to the text it captured.</summary>
+    private string NormaliseRaw(string raw, SourcePosition start)
+    {
+        var lines = raw.Replace("\r\n", "\n").Split('\n');
+
+        // A single-line raw string is taken exactly as written.
+        if (lines.Length == 1) return raw;
+
+        if (lines[0].Trim().Length != 0)
+        {
+            _diagnostics.Report(ErrorCode.UnterminatedString, start,
+                "多行原始字符串的内容必须从开始分隔符的下一行开始。");
+            return raw;
+        }
+
+        var closing = lines[^1];
+        if (closing.Trim().Length != 0)
+        {
+            _diagnostics.Report(ErrorCode.UnterminatedString, start,
+                "多行原始字符串的结束分隔符必须独占一行。");
+            return raw;
+        }
+
+        var indent = closing.Length;
+        var body = lines[1..^1];
+
+        for (var i = 0; i < body.Length; i++)
+        {
+            if (body[i].Trim().Length == 0) { body[i] = string.Empty; continue; }
+
+            if (body[i].Length < indent || body[i][..indent].Trim().Length != 0)
+            {
+                _diagnostics.Report(ErrorCode.UnterminatedString, start,
+                    "多行原始字符串的每一行缩进都不能少于结束分隔符。");
+                return raw;
+            }
+
+            body[i] = body[i][indent..];
+        }
+
+        return string.Join('\n', body);
+    }
+
     private Token ReadString(SourcePosition start)
     {
         var begin = _pos;
@@ -401,10 +645,17 @@ public sealed class Lexer
     /// and parsed later; brace, bracket, paren and string nesting are tracked so that a hole
     /// containing its own braces or strings closes at the right place.
     /// </summary>
-    private Token ReadInterpolatedString(SourcePosition start)
+    /// <summary>
+    /// Scans <c>$"..."</c>. In <paramref name="verbatim"/> mode (<c>$@"..."</c>) there are no
+    /// backslash escapes, newlines are allowed, and <c>""</c> stands for one quote.
+    /// </summary>
+    private Token ReadInterpolatedString(SourcePosition start, bool verbatim = false)
     {
         var begin = _pos;
-        _pos += 2; // $"
+
+        // Skip the $ / @ prefix, however it was spelled, and the opening quote.
+        while (Current != '"') _pos++;
+        _pos++;
 
         var parts = new List<RawInterpolationPart>();
         var text = new StringBuilder();
@@ -420,13 +671,22 @@ public sealed class Lexer
 
         while (true)
         {
-            if (_pos >= _text.Length || Current == '\n')
+            if (_pos >= _text.Length || (!verbatim && Current == '\n'))
             {
                 _diagnostics.Report(ErrorCode.UnterminatedString, start, "插值字符串未闭合。");
                 break;
             }
 
-            if (Current == '"') { _pos++; break; }
+            if (Current == '"')
+            {
+                if (!verbatim || Peek() != '"') { _pos++; break; }
+
+                text.Append('"');
+                _pos += 2;
+                continue;
+            }
+
+            if (verbatim && Current == '\n') { _line++; _lineStart = _pos + 1; }
 
             if (Current == '{' && Peek() == '{') { text.Append('{'); _pos += 2; continue; }
             if (Current == '}' && Peek() == '}') { text.Append('}'); _pos += 2; continue; }
@@ -447,7 +707,7 @@ public sealed class Lexer
                 continue;
             }
 
-            if (Current == '\\')
+            if (!verbatim && Current == '\\')
             {
                 _pos++;
                 if (TryReadEscape(out var decoded)) text.Append(decoded);
@@ -626,7 +886,10 @@ public sealed class Lexer
             case ';': kind = SyntaxKind.Semicolon; length = 1; break;
             case ':': kind = SyntaxKind.Colon; length = 1; break;
             case '~': kind = SyntaxKind.Tilde; length = 1; break;
-            case '.': kind = SyntaxKind.Dot; length = 1; break;
+            case '.':
+                if (Peek() == '.') { kind = SyntaxKind.DotDot; length = 2; }
+                else { kind = SyntaxKind.Dot; length = 1; }
+                break;
 
             case '?':
                 if (n == '?' && n2 == '=') { kind = SyntaxKind.QuestionQuestionEquals; length = 3; }

@@ -114,6 +114,16 @@ public sealed class Calculator
 
     public string Describe(string label, int count = 1, string suffix = "!") => $"{label}:{count}{suffix}";
 
+    public bool TryHalve(int value, out int half)
+    {
+        half = value / 2;
+        return value % 2 == 0;
+    }
+
+    public void Bump(ref int value) => value++;
+
+    public void Swap(ref int a, ref int b) => (a, b) = (b, a);
+
     public int Ambiguous(int a, long b) => 1;
     public int Ambiguous(long a, int b) => 2;
 
@@ -125,6 +135,21 @@ public sealed class Calculator
 
     public int Counter { get; set; }
     public int ReadOnlyValue => 7;
+}
+
+/// <summary>A record, so that <c>with</c> has something to clone.</summary>
+public sealed record Point(int X, int Y);
+
+/// <summary>Records that it was used and disposed, for `using` and `lock` tests.</summary>
+public sealed class DisposeProbe : IDisposable
+{
+    public int Touched { get; private set; }
+
+    public int Disposed { get; private set; }
+
+    public void Touch() => Touched++;
+
+    public void Dispose() => Disposed++;
 }
 
 // ---------------------------------------------------------------- async shapes
@@ -199,6 +224,8 @@ public sealed class Counter
 /// <summary>Methods that take delegates, for lambda binding and overload resolution.</summary>
 public sealed class Functional
 {
+    public int Double(int x) => x * 2;
+
     public int Apply(Func<int, int> f, int x) => f(x);
 
     public int Apply(Func<int, int> f) => f(1);

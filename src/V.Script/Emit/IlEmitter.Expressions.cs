@@ -29,6 +29,9 @@ internal sealed partial class IlEmitter
             case BoundIndexerAccess indexer: EmitIndexerAccess(indexer); break;
             case BoundArrayAccess array: EmitArrayAccess(array); break;
             case BoundObjectCreation creation: EmitObjectCreation(creation); break;
+            case BoundTupleLiteral tuple: EmitTupleLiteral(tuple); break;
+            case BoundLocalAddress address: EmitAddressOf(new BoundLocalAccess(address.Position, address.Local)); break;
+            case BoundMethodGroupConversion conversion: EmitMethodGroupConversion(conversion); break;
             case BoundArrayCreation creation: EmitArrayCreation(creation); break;
             case BoundNewArray creation: EmitNewArray(creation); break;
             case BoundThrowExpression thrown: EmitThrowExpression(thrown); break;
@@ -45,6 +48,8 @@ internal sealed partial class IlEmitter
             case BoundUnboundLambda:
             case BoundUnboundCollection:
             case BoundDefaultLiteral:
+            case BoundOutVariable:
+            case BoundMethodGroup:
                 throw new InvalidOperationException("绑定失败的表达式不应到达发射阶段。");
 
             default:
@@ -105,6 +110,11 @@ internal sealed partial class IlEmitter
             case string s: _il.Emit(OpCodes.Ldstr, s); break;
             case decimal d: EmitDecimal(d); break;
             case Enum e: EmitEnumConstant(e, baseType); break;
+
+            // A native-sized constant is pushed as int and widened, which is what the C#
+            // compiler does for any value that fits.
+            case nint v: EmitLdcI4((int)v); _il.Emit(OpCodes.Conv_I); break;
+            case nuint v: EmitLdcI4(unchecked((int)v)); _il.Emit(OpCodes.Conv_U); break;
             default:
                 throw new InvalidOperationException($"无法发射常量 {value.GetType().Name}。");
         }
@@ -206,11 +216,11 @@ internal sealed partial class IlEmitter
         }
 
         EmitExpression(conversion.Operand);
-        EmitValueConversion(from, to);
+        EmitValueConversion(from, to, conversion.IsChecked);
     }
 
     /// <summary>Conversions between plain (non-nullable) types once the value is on the stack.</summary>
-    private void EmitValueConversion(Type from, Type to)
+    private void EmitValueConversion(Type from, Type to, bool isChecked = false)
     {
         if (from == to) return;
 
@@ -243,7 +253,7 @@ internal sealed partial class IlEmitter
             return;
         }
 
-        EmitNumericConversion(fromBase, toBase);
+        EmitNumericConversion(fromBase, toBase, isChecked);
     }
 
     private static MethodInfo FindDecimalConversion(Type from, Type to)
@@ -260,9 +270,17 @@ internal sealed partial class IlEmitter
             $"decimal 与 {to.Name} 之间没有转换运算符。");
     }
 
-    private void EmitNumericConversion(Type from, Type to)
+    private void EmitNumericConversion(Type from, Type to, bool isChecked = false)
     {
         var fromUnsigned = IsUnsigned(from);
+
+        // A conversion out of a floating type never traps in IL's checked forms either, so only
+        // integer sources get the .ovf opcodes.
+        if (isChecked && from != typeof(float) && from != typeof(double))
+        {
+            EmitCheckedNumericConversion(to, fromUnsigned);
+            return;
+        }
 
         switch (Type.GetTypeCode(to))
         {
@@ -288,13 +306,72 @@ internal sealed partial class IlEmitter
                 _il.Emit(OpCodes.Conv_R8);
                 break;
             default:
+                // nint / nuint have no TypeCode of their own; they are native-sized integers.
+                if (to == typeof(nint)) { _il.Emit(OpCodes.Conv_I); break; }
+                if (to == typeof(nuint)) { _il.Emit(OpCodes.Conv_U); break; }
+
                 throw new InvalidOperationException($"无法从 {from.Name} 转换为 {to.Name}。");
+        }
+    }
+
+    /// <summary>The <c>conv.ovf.*</c> family; the <c>.un</c> suffix describes the source.</summary>
+    private void EmitCheckedNumericConversion(Type to, bool fromUnsigned)
+    {
+        switch (Type.GetTypeCode(to))
+        {
+            case TypeCode.SByte:
+                _il.Emit(fromUnsigned ? OpCodes.Conv_Ovf_I1_Un : OpCodes.Conv_Ovf_I1);
+                break;
+            case TypeCode.Byte:
+                _il.Emit(fromUnsigned ? OpCodes.Conv_Ovf_U1_Un : OpCodes.Conv_Ovf_U1);
+                break;
+            case TypeCode.Int16:
+                _il.Emit(fromUnsigned ? OpCodes.Conv_Ovf_I2_Un : OpCodes.Conv_Ovf_I2);
+                break;
+            case TypeCode.UInt16:
+            case TypeCode.Char:
+                _il.Emit(fromUnsigned ? OpCodes.Conv_Ovf_U2_Un : OpCodes.Conv_Ovf_U2);
+                break;
+            case TypeCode.Int32:
+                _il.Emit(fromUnsigned ? OpCodes.Conv_Ovf_I4_Un : OpCodes.Conv_Ovf_I4);
+                break;
+            case TypeCode.UInt32:
+                _il.Emit(fromUnsigned ? OpCodes.Conv_Ovf_U4_Un : OpCodes.Conv_Ovf_U4);
+                break;
+            case TypeCode.Int64:
+                _il.Emit(fromUnsigned ? OpCodes.Conv_Ovf_I8_Un : OpCodes.Conv_Ovf_I8);
+                break;
+            case TypeCode.UInt64:
+                _il.Emit(fromUnsigned ? OpCodes.Conv_Ovf_U8_Un : OpCodes.Conv_Ovf_U8);
+                break;
+            case TypeCode.Single:
+                if (fromUnsigned) _il.Emit(OpCodes.Conv_R_Un);
+                _il.Emit(OpCodes.Conv_R4);
+                break;
+            case TypeCode.Double:
+                if (fromUnsigned) _il.Emit(OpCodes.Conv_R_Un);
+                _il.Emit(OpCodes.Conv_R8);
+                break;
+            default:
+                if (to == typeof(nint))
+                {
+                    _il.Emit(fromUnsigned ? OpCodes.Conv_Ovf_I_Un : OpCodes.Conv_Ovf_I);
+                    break;
+                }
+
+                if (to == typeof(nuint))
+                {
+                    _il.Emit(fromUnsigned ? OpCodes.Conv_Ovf_U_Un : OpCodes.Conv_Ovf_U);
+                    break;
+                }
+
+                throw new InvalidOperationException($"无法在 checked 下转换为 {to.Name}。");
         }
     }
 
     private static bool IsUnsigned(Type type) =>
         type == typeof(byte) || type == typeof(ushort) || type == typeof(uint) ||
-        type == typeof(ulong) || type == typeof(char);
+        type == typeof(ulong) || type == typeof(char) || type == typeof(nuint);
 
     /// <summary>
     /// Nullable conversions. Widening wraps the value; narrowing unwraps through
@@ -380,11 +457,15 @@ internal sealed partial class IlEmitter
 
         EmitExpression(binary.Left);
         EmitExpression(binary.Right);
-        EmitBinaryCore(binary.Kind, binary.Left.Type, binary.Method);
+        EmitBinaryCore(binary.Kind, binary.Left.Type, binary.Method, binary.IsChecked);
     }
 
     /// <summary>Emits the operation itself, with both operands already on the stack.</summary>
-    private void EmitBinaryCore(BoundBinaryKind kind, Type operandType, MethodInfo? method)
+    /// <remarks>
+    /// Floating point never traps, so <paramref name="isChecked"/> only reaches the integer
+    /// opcodes — which is exactly how <c>checked</c> behaves in C#.
+    /// </remarks>
+    private void EmitBinaryCore(BoundBinaryKind kind, Type operandType, MethodInfo? method, bool isChecked = false)
     {
         if (method is not null)
         {
@@ -394,12 +475,19 @@ internal sealed partial class IlEmitter
 
         var unsigned = IsUnsigned(operandType.IsEnum ? Enum.GetUnderlyingType(operandType) : operandType);
         var floating = operandType == typeof(float) || operandType == typeof(double);
+        var trapping = isChecked && !floating;
 
         switch (kind)
         {
-            case BoundBinaryKind.Add: _il.Emit(OpCodes.Add); break;
-            case BoundBinaryKind.Subtract: _il.Emit(OpCodes.Sub); break;
-            case BoundBinaryKind.Multiply: _il.Emit(OpCodes.Mul); break;
+            case BoundBinaryKind.Add:
+                _il.Emit(trapping ? (unsigned ? OpCodes.Add_Ovf_Un : OpCodes.Add_Ovf) : OpCodes.Add);
+                break;
+            case BoundBinaryKind.Subtract:
+                _il.Emit(trapping ? (unsigned ? OpCodes.Sub_Ovf_Un : OpCodes.Sub_Ovf) : OpCodes.Sub);
+                break;
+            case BoundBinaryKind.Multiply:
+                _il.Emit(trapping ? (unsigned ? OpCodes.Mul_Ovf_Un : OpCodes.Mul_Ovf) : OpCodes.Mul);
+                break;
             case BoundBinaryKind.Divide: _il.Emit(unsigned ? OpCodes.Div_Un : OpCodes.Div); break;
             case BoundBinaryKind.Modulo: _il.Emit(unsigned ? OpCodes.Rem_Un : OpCodes.Rem); break;
             case BoundBinaryKind.BitAnd: _il.Emit(OpCodes.And); break;
@@ -487,7 +575,7 @@ internal sealed partial class IlEmitter
 
         EmitGetValueOrDefault(left);
         EmitGetValueOrDefault(right);
-        EmitBinaryCore(binary.Kind, Conversions.Unlift(binary.Right.Type), binary.Method);
+        EmitBinaryCore(binary.Kind, Conversions.Unlift(binary.Right.Type), binary.Method, binary.IsChecked);
 
         if (IsComparison(binary.Kind))
         {
@@ -810,7 +898,15 @@ internal sealed partial class IlEmitter
     private void EmitArrayAccess(BoundArrayAccess array)
     {
         EmitExpression(array.Array);
-        EmitExpression(array.Index);
+        foreach (var index in array.Indices) EmitExpression(index);
+
+        if (array.IsMultiDimensional)
+        {
+            // Multi-dimensional arrays have no ldelem; the runtime gives their type a Get method.
+            _il.Emit(OpCodes.Call, array.Array.Type.GetMethod("Get")!);
+            return;
+        }
+
         EmitLdelem(array.Type);
     }
 
@@ -882,10 +978,50 @@ internal sealed partial class IlEmitter
         _il.Emit(OpCodes.Throw);
     }
 
+    /// <summary>
+    /// Builds a delegate over a real method: push the receiver (or null), take the function
+    /// pointer, and call the delegate's two-argument constructor.
+    /// </summary>
+    private void EmitMethodGroupConversion(BoundMethodGroupConversion conversion)
+    {
+        if (conversion.Receiver is null) _il.Emit(OpCodes.Ldnull);
+        else EmitExpression(conversion.Receiver);
+
+        if (conversion.Method.IsVirtual && conversion.Receiver is not null)
+        {
+            _il.Emit(OpCodes.Dup);
+            _il.Emit(OpCodes.Ldvirtftn, conversion.Method);
+        }
+        else
+        {
+            _il.Emit(OpCodes.Ldftn, conversion.Method);
+        }
+
+        var constructor = conversion.Type.GetConstructor([typeof(object), typeof(IntPtr)])!;
+        _il.Emit(OpCodes.Newobj, constructor);
+    }
+
+    private void EmitTupleLiteral(BoundTupleLiteral tuple)
+    {
+        foreach (var element in tuple.Elements) EmitExpression(element);
+        _il.Emit(OpCodes.Newobj, tuple.Constructor);
+    }
+
     private void EmitNewArray(BoundNewArray creation)
     {
-        EmitExpression(creation.Length);
-        _il.Emit(OpCodes.Newarr, creation.ElementType);
+        foreach (var length in creation.Lengths) EmitExpression(length);
+
+        if (creation.Lengths.Count == 1)
+        {
+            _il.Emit(OpCodes.Newarr, creation.ElementType);
+            return;
+        }
+
+        // A multi-dimensional array has no newarr form; its type carries a constructor instead.
+        var constructor = creation.Type.GetConstructor(
+            [.. Enumerable.Repeat(typeof(int), creation.Lengths.Count)])!;
+
+        _il.Emit(OpCodes.Newobj, constructor);
     }
 
     private void EmitArrayCreation(BoundArrayCreation creation)
@@ -1020,7 +1156,7 @@ internal sealed partial class IlEmitter
             case BoundArrayAccess array:
             {
                 EmitExpression(array.Array);
-                EmitExpression(array.Index);
+                foreach (var index in array.Indices) EmitExpression(index);
                 EmitExpression(assignment.Value);
 
                 LocalBuilder? stash = null;
@@ -1031,7 +1167,9 @@ internal sealed partial class IlEmitter
                     _il.Emit(OpCodes.Stloc, stash);
                 }
 
-                EmitStelem(array.Type);
+                if (array.IsMultiDimensional) _il.Emit(OpCodes.Call, array.Array.Type.GetMethod("Set")!);
+                else EmitStelem(array.Type);
+
                 if (stash is not null) _il.Emit(OpCodes.Ldloc, stash);
                 return;
             }

@@ -66,6 +66,11 @@ internal sealed partial class Binder
         AsExpressionSyntax asExpression => BindAs(asExpression),
         TypeofExpressionSyntax typeofExpression => BindTypeof(typeofExpression),
         ObjectCreationExpressionSyntax creation => BindObjectCreation(creation),
+        TupleExpressionSyntax tuple => BindTupleExpression(tuple),
+        CheckedExpressionSyntax region => BindCheckedExpression(region),
+        FromEndExpressionSyntax fromEnd => BindFromEnd(fromEnd),
+        RangeExpressionSyntax range => BindRange(range),
+        WithExpressionSyntax with => BindWith(with),
         ArrayCreationExpressionSyntax array => BindArrayCreation(array),
         CollectionExpressionSyntax collection => new BoundUnboundCollection(collection.Position, collection),
         DefaultExpressionSyntax defaultValue => BindDefault(defaultValue),
@@ -111,6 +116,11 @@ internal sealed partial class Binder
         var savedLoopDepth = _loopDepth;
         var savedSwitchDepth = _switchDepth;
         var savedHandlerDepth = _handlerDepth;
+        var savedProtectedDepth = _protectedDepth;
+        var savedLabels = _labels;
+        var savedGotos = _pendingGotos;
+        var savedAsyncContext = _isAsyncContext;
+        var savedStaticBoundary = _staticBoundary;
         var savedReturnType = _returnType;
         var savedSawReturn = _sawReturn;
         var savedProbe = _returnTypeProbe;
@@ -122,7 +132,27 @@ internal sealed partial class Binder
         _loopDepth = 0;
         _switchDepth = 0;
         _handlerDepth = 0;
-        _returnType = invoke.ReturnType;
+        _protectedDepth = 0;
+        _labels = [];
+        _pendingGotos = [];
+        _isAsyncContext = syntax.IsAsync;
+
+        // An async lambda's body produces the awaited value; the Task around it is the runtime's
+        // doing, exactly as for an async script body.
+        var declaredReturnType = invoke.ReturnType;
+        var bodyReturnType = syntax.IsAsync
+            ? AwaitHelpers.UnwrapTaskType(declaredReturnType)
+            : declaredReturnType;
+
+        if (bodyReturnType is null)
+        {
+            _isAsyncContext = savedAsyncContext;
+            return Fail(syntax.Position, ErrorCode.CannotConvert,
+                $"async lambda 必须返回 Task 或 Task<T>，{TypeResolver.Display(delegateType)} 返回 " +
+                $"{TypeResolver.Display(declaredReturnType)}。");
+        }
+
+        _returnType = bodyReturnType;
         _sawReturn = false;
         _returnTypeProbe = null;
 
@@ -163,7 +193,7 @@ internal sealed partial class Binder
             lambdaParameters.Add(parameter);
         }
 
-        var returnType = invoke.ReturnType;
+        var returnType = bodyReturnType;
 
         BoundExpression? body = null;
         BoundStatement? bodyStatement = null;
@@ -185,6 +215,8 @@ internal sealed partial class Binder
             }
         }
 
+        ValidateGotos();
+
         var lambdaLocals = _locals;
 
         _functionDepth--;
@@ -194,13 +226,19 @@ internal sealed partial class Binder
         _loopDepth = savedLoopDepth;
         _switchDepth = savedSwitchDepth;
         _handlerDepth = savedHandlerDepth;
+        _protectedDepth = savedProtectedDepth;
+        _labels = savedLabels;
+        _pendingGotos = savedGotos;
+        _isAsyncContext = savedAsyncContext;
+        _staticBoundary = savedStaticBoundary;
         _returnType = savedReturnType;
         _sawReturn = savedSawReturn;
         _returnTypeProbe = savedProbe;
 
         var lambda = new BoundLambda(
             syntax.Position, delegateType, lambdaParameters, lambdaLocals,
-            body, returnType, ownScope, savedClosure, bodyStatement);
+            body, returnType, ownScope, savedClosure, bodyStatement,
+            syntax.IsAsync, declaredReturnType);
 
         _lambdas.Add(lambda);
         return lambda;
@@ -329,13 +367,19 @@ internal sealed partial class Binder
     private BoundExpression BindName(NameExpressionSyntax syntax)
     {
         if (_scope.TryLookup(syntax.Name, out var local))
-            return MakeLocalAccess(syntax.Position, local);
+        {
+            return local.ConstantValue is { } constant
+                ? constant with { Position = syntax.Position }
+                : MakeLocalAccess(syntax.Position, local);
+        }
 
         if (TryBindGlobalsMember(syntax.Position, syntax.Name, out var globalsMember))
             return globalsMember!;
 
         var type = _resolver.ResolveName(syntax.Name);
         if (type is not null) return new BoundTypeReference(syntax.Position, type);
+
+        if (TryBindMethodGroup(syntax.Position, syntax.Name) is { } methodGroup) return methodGroup;
 
         return Fail(syntax.Position, ErrorCode.UndefinedName, $"找不到名称 '{syntax.Name}'。");
     }
@@ -347,7 +391,15 @@ internal sealed partial class Binder
     private BoundExpression MakeLocalAccess(SourcePosition position, LocalSymbol local)
     {
         if (local.FunctionDepth < _functionDepth)
+        {
+            if (_staticBoundary >= 0 && local.FunctionDepth < _staticBoundary)
+            {
+                return Fail(position, ErrorCode.ConstructNotSupported,
+                    $"static 局部函数不能引用外部变量 '{local.Name}'。去掉 static，或把它作为参数传进来。");
+            }
+
             local.DeclaringScope!.Capture(local);
+        }
 
         return new BoundLocalAccess(position, local);
     }
@@ -443,6 +495,9 @@ internal sealed partial class Binder
     {
         var type = receiver.Type;
 
+        // A tuple element name is not a real member; it stands for a position.
+        if (TupleElementFor(receiver, name, position) is { } element) return element;
+
         var property = type.GetProperty(name, InstanceFlags);
         if (property is not null)
         {
@@ -464,6 +519,8 @@ internal sealed partial class Binder
             }
         }
 
+        if (TryBindMethodGroup(position, receiver, type, name) is { } methodGroup) return methodGroup;
+
         return Fail(position, ErrorCode.UndefinedMember,
             $"{TypeResolver.Display(type)} 不包含名为 '{name}' 的成员。{Suggest(type, name)}");
     }
@@ -479,6 +536,8 @@ internal sealed partial class Binder
 
         var nested = type.GetNestedType(name, BindingFlags.Public);
         if (nested is not null) return new BoundTypeReference(position, nested);
+
+        if (TryBindMethodGroup(position, null, type, name) is { } methodGroup) return methodGroup;
 
         return Fail(position, ErrorCode.UndefinedMember,
             $"{TypeResolver.Display(type)} 不包含名为 '{name}' 的静态成员。{Suggest(type, name)}");
@@ -628,14 +687,14 @@ internal sealed partial class Binder
         }
 
         var arguments = syntax.Arguments
-            .Select(a => (Argument: a, Bound: BindExpression(a.Value)))
+            .Select(a => (Argument: a, Bound: BindArgument(a)))
             .ToArray();
 
         if (arguments.Any(a => a.Bound is BoundErrorExpression))
             return new BoundErrorExpression(syntax.Position);
 
         var bound = arguments.Select(a => a.Bound).ToArray();
-        var infos = arguments.Select(a => Describe(a.Bound, a.Argument.Name)).ToArray();
+        var infos = arguments.Select(a => Describe(a.Bound, a.Argument)).ToArray();
 
         var resolution = methods.Count > 0
             ? OverloadResolution.Resolve(methods, infos, (i, types) => ProbeLambdaReturn(bound, i, types))
@@ -687,7 +746,7 @@ internal sealed partial class Binder
                 $"'{methodName}' 是实例方法，需要一个实例。");
         }
 
-        var finalArguments = BuildArguments(best, arguments.Select(a => a.Bound).ToArray(), syntax.Position);
+        var finalArguments = BuildArguments(best, MaterialiseOutVariables(best, bound), syntax.Position);
         return new BoundCall(syntax.Position, method.IsStatic ? null : receiver, method, finalArguments);
     }
 
@@ -793,6 +852,14 @@ internal sealed partial class Binder
         }
 
         var returnType = ProbeLambdaReturn(syntax, parameterTypes) ?? typeof(void);
+
+        if (syntax.IsAsync)
+        {
+            returnType = returnType == typeof(void)
+                ? typeof(Task)
+                : typeof(Task<>).MakeGenericType(returnType);
+        }
+
         return MakeDelegateType(parameterTypes, returnType);
     }
 
@@ -820,6 +887,7 @@ internal sealed partial class Binder
     private Type? ProbeLambdaReturn(IReadOnlyList<BoundExpression> bound, int index, Type[] parameterTypes)
     {
         if (index < 0 || index >= bound.Count) return null;
+        if (bound[index] is BoundMethodGroup group) return ProbeMethodGroupReturn(group, parameterTypes);
         if (bound[index] is not BoundUnboundLambda unbound) return null;
 
         return ProbeLambdaReturn(unbound.Syntax, parameterTypes);
@@ -838,6 +906,10 @@ internal sealed partial class Binder
         var savedLoopDepth = _loopDepth;
         var savedSwitchDepth = _switchDepth;
         var savedHandlerDepth = _handlerDepth;
+        var savedProtectedDepth = _protectedDepth;
+        var savedLabels = _labels;
+        var savedGotos = _pendingGotos;
+        var savedAsyncContext = _isAsyncContext;
         var lambdaCount = _lambdas.Count;
 
         _diagnostics = new DiagnosticBag();
@@ -848,6 +920,10 @@ internal sealed partial class Binder
         _loopDepth = 0;
         _switchDepth = 0;
         _handlerDepth = 0;
+        _protectedDepth = 0;
+        _labels = [];
+        _pendingGotos = [];
+        _isAsyncContext = syntax.IsAsync;
 
         try
         {
@@ -901,6 +977,10 @@ internal sealed partial class Binder
             _loopDepth = savedLoopDepth;
             _switchDepth = savedSwitchDepth;
             _handlerDepth = savedHandlerDepth;
+            _protectedDepth = savedProtectedDepth;
+            _labels = savedLabels;
+            _pendingGotos = savedGotos;
+            _isAsyncContext = savedAsyncContext;
             _lambdas.RemoveRange(lambdaCount, _lambdas.Count - lambdaCount);
         }
 
@@ -962,8 +1042,45 @@ internal sealed partial class Binder
                     result.Add(method);
         }
 
-        return result;
+        return RemoveHidden(result);
     }
+
+    /// <summary>
+    /// Drops base-class methods that a derived class hides with the same signature. Reflection
+    /// reports both, and to overload resolution they look equally good — <c>Task&lt;T&gt;</c>
+    /// hiding <c>Task.GetAwaiter</c> is the case that makes this matter.
+    /// </summary>
+    private static List<MethodBase> RemoveHidden(List<MethodBase> methods)
+    {
+        if (methods.Count < 2) return methods;
+
+        var kept = new List<MethodBase>(methods.Count);
+
+        foreach (var method in methods)
+        {
+            var hidden = methods.Any(other =>
+                !ReferenceEquals(other, method) &&
+                SameSignature(other, method) &&
+                IsMoreDerived(other.DeclaringType, method.DeclaringType));
+
+            if (!hidden) kept.Add(method);
+        }
+
+        return kept.Count == 0 ? methods : kept;
+    }
+
+    private static bool SameSignature(MethodBase left, MethodBase right)
+    {
+        var a = left.GetParameters();
+        var b = right.GetParameters();
+
+        return a.Length == b.Length &&
+               left.IsStatic == right.IsStatic &&
+               !a.Where((p, i) => p.ParameterType != b[i].ParameterType).Any();
+    }
+
+    private static bool IsMoreDerived(Type? derived, Type? bas) =>
+        derived is not null && bas is not null && derived != bas && bas.IsAssignableFrom(derived);
 
     /// <summary>Materialises the final argument list: conversions applied, defaults filled, params packed.</summary>
     private IReadOnlyList<BoundExpression> BuildArguments(
@@ -995,7 +1112,9 @@ internal sealed partial class Binder
                 continue;
             }
 
-            result.Add(Convert(bound[indices[0]], parameter.ParameterType, position, explicitCast: false));
+            result.Add(parameter.ParameterType.IsByRef
+                ? bound[indices[0]]
+                : Convert(bound[indices[0]], parameter.ParameterType, position, explicitCast: false));
         }
 
         return result;
@@ -1015,20 +1134,46 @@ internal sealed partial class Binder
     private BoundExpression BindIndex(IndexExpressionSyntax syntax)
     {
         var receiver = BindExpression(syntax.Target);
-        if (receiver is BoundErrorExpression) return receiver;
+        return receiver is BoundErrorExpression
+            ? receiver
+            : BindIndexAccess(receiver, syntax.Arguments, syntax.Position);
+    }
 
-        var arguments = syntax.Arguments.Select(BindExpression).ToArray();
+    /// <summary>Indexing an already-bound receiver, which an initializer also needs.</summary>
+    private BoundExpression BindIndexAccess(
+        BoundExpression receiver,
+        IReadOnlyList<ExpressionSyntax> argumentSyntax,
+        SourcePosition position)
+    {
+        var arguments = argumentSyntax.Select(BindExpression).ToArray();
+        if (arguments.Any(a => a is BoundErrorExpression)) return new BoundErrorExpression(position);
+
+        if (TryBindIndexOrRangeAccess(receiver, arguments, position) is { } special) return special;
+
+        return BindIndexAccessCore(receiver, arguments, position);
+    }
+
+    private BoundExpression BindIndexAccessCore(
+        BoundExpression receiver,
+        IReadOnlyList<BoundExpression> arguments,
+        SourcePosition position)
+    {
+        var syntax = new { Position = position };
 
         if (receiver.Type.IsArray)
         {
-            if (receiver.Type.GetArrayRank() != 1 || arguments.Length != 1)
+            var rank = receiver.Type.GetArrayRank();
+            if (rank != arguments.Count)
             {
                 return Fail(syntax.Position, ErrorCode.NotIndexable,
-                    "只支持一维数组索引。");
+                    $"数组是 {rank} 维的，但给了 {arguments.Count} 个下标。");
             }
 
-            var index = Convert(arguments[0], typeof(int), syntax.Position, explicitCast: false);
-            return new BoundArrayAccess(syntax.Position, receiver.Type.GetElementType()!, receiver, index);
+            var indices = arguments
+                .Select(a => Convert(a, typeof(int), syntax.Position, explicitCast: false))
+                .ToArray();
+
+            return new BoundArrayAccess(syntax.Position, receiver.Type.GetElementType()!, receiver, indices);
         }
 
         var indexers = FindIndexers(receiver.Type);
@@ -1111,6 +1256,17 @@ internal sealed partial class Binder
             : new BoundTypeofExpression(syntax.Position, target);
     }
 
+    private BoundExpression BindCheckedExpression(CheckedExpressionSyntax syntax)
+    {
+        var saved = _checked;
+        _checked = syntax.IsChecked;
+
+        var operand = BindExpression(syntax.Operand);
+
+        _checked = saved;
+        return operand;
+    }
+
     private BoundExpression BindConditionalExpression(ConditionalExpressionSyntax syntax)
     {
         var condition = BindCondition(syntax.Condition);
@@ -1136,30 +1292,7 @@ internal sealed partial class Binder
             Convert(whenFalse, type, syntax.Position, explicitCast: false));
     }
 
-    private static Type? BestCommonType(Type left, Type right)
-    {
-        if (left == right) return left;
-
-        // `default`, a throw expression and a collection expression take whatever the other
-        // branch is; they never drive the choice themselves.
-        if (Conversions.AdoptsTargetType(left)) return Conversions.AdoptsTargetType(right) ? null : right;
-        if (Conversions.AdoptsTargetType(right)) return left;
-
-        if (left == Conversions.NullLiteralType) return Conversions.IsNullAssignable(right) ? right : Conversions.Lift(right);
-        if (right == Conversions.NullLiteralType) return Conversions.IsNullAssignable(left) ? left : Conversions.Lift(left);
-
-        var leftToRight = Conversions.HasImplicit(left, right);
-        var rightToLeft = Conversions.HasImplicit(right, left);
-
-        if (leftToRight && !rightToLeft) return right;
-        if (rightToLeft && !leftToRight) return left;
-        if (leftToRight && rightToLeft) return left;
-
-        if (Conversions.IsNumeric(left) && Conversions.IsNumeric(right))
-            return NumericPromotion.Promote(left, right);
-
-        return null;
-    }
+    private static Type? BestCommonType(Type left, Type right) => Conversions.BestCommonType(left, right);
 
     // ============================================================ await
 
@@ -1168,16 +1301,14 @@ internal sealed partial class Binder
         var operand = BindExpression(syntax.Operand);
         if (operand is BoundErrorExpression) return operand;
 
-        if (!_isAsync)
+        if (!_isAsyncContext)
         {
-            return Fail(syntax.Position, ErrorCode.AwaitInSynchronousScript,
-                "同步脚本中不能使用 'await'。请改用 CompileAsync 编译。");
-        }
-
-        if (_functionDepth > 0)
-        {
-            return Fail(syntax.Position, ErrorCode.AwaitInLambda,
-                "lambda 内不能使用 'await'。lambda 被编译为独立的同步方法，无法承载挂起点。");
+            return _functionDepth > 0
+                ? Fail(syntax.Position, ErrorCode.AwaitInLambda,
+                    "lambda 或局部函数内使用 'await' 需要把它标记为 async，" +
+                    "例如 async x => await ...。")
+                : Fail(syntax.Position, ErrorCode.AwaitInSynchronousScript,
+                    "同步脚本中不能使用 'await'。请改用 CompileAsync 编译。");
         }
 
         if (_handlerDepth > 0)

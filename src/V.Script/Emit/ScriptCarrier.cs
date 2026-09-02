@@ -14,6 +14,11 @@ namespace V.Script.Emit;
 ///     <see cref="DynamicMethod"/> cannot express (it has no <c>SetImplementationFlags</c>), so
 ///     each one gets its own collectible assembly — roughly 31 KB, individually unloadable.</item>
 /// </list>
+/// <para>
+/// An <c>async</c> lambda needs the same flag, so a synchronous script that contains one also
+/// gets an assembly — for the lambdas alone. The script body stays a <see cref="DynamicMethod"/>,
+/// which is fine because it only ever reaches a lambda through the host's table.
+/// </para>
 /// </summary>
 internal static class ScriptCarrier
 {
@@ -37,9 +42,21 @@ internal static class ScriptCarrier
             typeof(ScriptCarrier).Module,
             skipVisibility: true);
 
-        IlEmitter.EmitScript(method.GetILGenerator(), script, host);
+        // Only async lambdas need somewhere real to live; a script without them costs nothing.
+        var needsAssembly = script.Lambdas.Any(l => l.IsAsync);
 
-        return (method.CreateDelegate(delegateType, host), null);
+        AssemblyBuilder? assembly = null;
+        TypeBuilder? lambdaHost = null;
+
+        if (needsAssembly) (assembly, lambdaHost) = DefineGeneratedType($"{name}.Lambdas");
+
+        var publish = IlEmitter.EmitScript(method.GetILGenerator(), script, host, lambdaHost);
+
+        var created = lambdaHost?.CreateType();
+        publish(created);
+
+        var owner = created is null ? null : new GeneratedAssembly(assembly!, created);
+        return (method.CreateDelegate(delegateType, host), owner);
     }
 
     public static (Delegate Invoke, IDisposable? Owner) CompileAsynchronous(
@@ -58,13 +75,7 @@ internal static class ScriptCarrier
             ? typeof(Task)
             : typeof(Task<>).MakeGenericType(ilReturnType);
 
-        var assemblyName = new AssemblyName($"V.Script.Generated.{name}");
-        var assembly = AssemblyBuilder.DefineDynamicAssembly(assemblyName, AssemblyBuilderAccess.RunAndCollect);
-        var module = assembly.DefineDynamicModule("M");
-
-        var type = module.DefineType(
-            "Script",
-            TypeAttributes.Public | TypeAttributes.Abstract | TypeAttributes.Sealed);
+        var (assembly, type) = DefineGeneratedType(name);
 
         var method = type.DefineMethod(
             "Run",
@@ -75,13 +86,28 @@ internal static class ScriptCarrier
         method.SetImplementationFlags(
             MethodImplAttributes.IL | MethodImplAttributes.Managed | AsyncImplFlag);
 
-        IlEmitter.EmitScript(method.GetILGenerator(), script, host);
+        // The script's own type hosts its async lambdas too: one assembly, one CreateType.
+        var publish = IlEmitter.EmitScript(method.GetILGenerator(), script, host, type);
 
         var created = type.CreateType()!;
+        publish(created);
+
         var runtimeMethod = created.GetMethod("Run", BindingFlags.Public | BindingFlags.Static)!;
 
         var invoke = runtimeMethod.CreateDelegate(delegateType, host);
         return (invoke, new GeneratedAssembly(assembly, created));
+    }
+
+    private static (AssemblyBuilder Assembly, TypeBuilder Type) DefineGeneratedType(string name)
+    {
+        var assemblyName = new AssemblyName($"V.Script.Generated.{name}");
+        var assembly = AssemblyBuilder.DefineDynamicAssembly(assemblyName, AssemblyBuilderAccess.RunAndCollect);
+
+        var type = assembly
+            .DefineDynamicModule("M")
+            .DefineType("Script", TypeAttributes.Public | TypeAttributes.Abstract | TypeAttributes.Sealed);
+
+        return (assembly, type);
     }
 
     private static Type[] BuildSignature(Type[] scriptParameterTypes)

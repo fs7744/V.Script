@@ -240,13 +240,20 @@ public sealed class ScriptEngine : IDisposable
     {
         var diagnostics = new DiagnosticBag();
 
-        var tokens = new Lexer(source, diagnostics).Tokenize();
+        // Conditional compilation is a text pass: excluded lines are blanked, so every later
+        // position still matches the original source.
+        var text = Syntax.Preprocessor.Apply(source, _options.PreprocessorSymbols, diagnostics);
+
+        var tokens = new Lexer(text, diagnostics).Tokenize();
         var unit = new Parser(tokens, diagnostics).ParseCompilationUnit();
 
         if (diagnostics.HasErrors) return (null, diagnostics.ToImmutable());
 
         var binder = new Binding.Binder(diagnostics, _resolver, parameters, returnType, isAsync);
         var bound = binder.BindScript(unit);
+
+        // Flow analysis runs on the lowered tree, so it sees one shape per construct.
+        if (!diagnostics.HasErrors) Binding.DefiniteAssignment.Analyze(bound, diagnostics);
 
         return diagnostics.HasErrors
             ? (null, diagnostics.ToImmutable())

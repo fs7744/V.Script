@@ -98,6 +98,12 @@ internal sealed partial class Binder
             case PropertyPatternSyntax propertyPattern:
                 return BindPropertyPattern(subject, propertyPattern, out narrowed);
 
+            case PositionalPatternSyntax positional:
+                return BindPositionalPattern(subject, positional, out narrowed);
+
+            case ListPatternSyntax list:
+                return BindListPattern(subject, list, out narrowed);
+
             default:
                 return new BoundErrorExpression(pattern.Position);
         }

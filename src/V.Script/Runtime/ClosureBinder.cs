@@ -22,7 +22,7 @@ internal static class ClosureBinder
     /// Builds a factory that produces the target delegate for a given closure, or returns null
     /// when the delegate shape has no specialisation.
     /// </summary>
-    public static Func<ScriptClosure, Delegate>? TryCreateFactory(DynamicMethod method, Type delegateType)
+    public static Func<ScriptClosure, Delegate>? TryCreateFactory(MethodInfo method, Type delegateType)
     {
         var invoke = delegateType.GetMethod("Invoke");
         if (invoke is null) return null;

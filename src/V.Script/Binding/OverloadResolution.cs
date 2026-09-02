@@ -7,9 +7,21 @@ namespace V.Script.Binding;
 /// when the argument is a lambda that has not been bound yet, in which case applicability is
 /// decided by parameter count rather than by a conversion.
 /// </summary>
-public readonly record struct ArgumentInfo(Type Type, string? Name, int LambdaArity = -1)
+public readonly record struct ArgumentInfo(
+    Type Type,
+    string? Name,
+    int LambdaArity = -1,
+    Syntax.ArgumentRefKind RefKind = Syntax.ArgumentRefKind.None)
 {
     public bool IsUnboundLambda => LambdaArity >= 0;
+
+    public bool IsByRef => RefKind != Syntax.ArgumentRefKind.None;
+
+    /// <summary>
+    /// True for arguments that only get a type once a target delegate is known: a lambda, and a
+    /// method group. Generic inference has to defer both to its second round.
+    /// </summary>
+    public bool NeedsTargetType => IsUnboundLambda || Type == Conversions.MethodGroupType;
 }
 
 /// <summary>
@@ -96,7 +108,6 @@ public static class OverloadResolution
             }
 
             var parameters = candidate.GetParameters();
-            if (parameters.Any(p => p.ParameterType.IsByRef)) continue;
 
             if (TryBuild(candidate, parameters, arguments, expanded: false, out var normal, out var normalTypes))
                 applicable.Add((normal! with { FromGenericDefinition = fromGeneric }, normalTypes!));
@@ -139,7 +150,14 @@ public static class OverloadResolution
         GenericInference.LambdaReturnProbe? probe)
     {
         var parameters = definition.GetParameters();
-        if (parameters.Any(p => p.ParameterType.IsByRef)) return null;
+
+        // A byref parameter whose element type mentions a type parameter would have to be
+        // inferred through the reference, which Unify does not do.
+        if (parameters.Any(p => p.ParameterType.IsByRef &&
+                                p.ParameterType.GetElementType()!.ContainsGenericParameters))
+        {
+            return null;
+        }
 
         var map = MapArguments(parameters, arguments);
         return map is null ? null : GenericInference.TryInfer(definition, arguments, map, probe);
@@ -224,11 +242,31 @@ public static class OverloadResolution
                 ? parameters[target].ParameterType.GetElementType()!
                 : parameters[target].ParameterType;
 
-            if (argument.IsUnboundLambda)
+            // ref/out has to agree on both sides, and the types must then match exactly.
+            if (argument.IsByRef || parameterType.IsByRef)
+            {
+                if (!argument.IsByRef || !parameterType.IsByRef) return false;
+
+                var wantsOut = parameters[target].IsOut;
+                if (wantsOut != (argument.RefKind == Syntax.ArgumentRefKind.Out)) return false;
+
+                if (argument.Type != Conversions.OutVariableType &&
+                    argument.Type != parameterType.GetElementType())
+                {
+                    return false;
+                }
+            }
+            else if (argument.IsUnboundLambda)
             {
                 if (Conversions.GetInvokeMethod(parameterType) is not { } invoke) return false;
                 if (invoke.GetParameters().Length != argument.LambdaArity) return false;
                 if (invoke.GetParameters().Any(p => p.ParameterType.IsByRef)) return false;
+            }
+            else if (argument.Type == Conversions.MethodGroupType)
+            {
+                // Which overload it is gets decided by the conversion; here it only has to be
+                // going somewhere a method group could go at all.
+                if (Conversions.GetInvokeMethod(parameterType) is null) return false;
             }
             else if (Conversions.AdoptsTargetType(argument.Type))
             {

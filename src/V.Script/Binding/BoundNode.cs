@@ -3,6 +3,23 @@ using V.Script.Diagnostics;
 
 namespace V.Script.Binding;
 
+/// <summary>
+/// A branch target. The emitter creates one IL label per symbol, which is what lets a jump be
+/// emitted before the label it targets has been seen.
+/// </summary>
+public sealed class LabelSymbol(string name)
+{
+    public string Name { get; } = name;
+
+    /// <summary>False until the labelled statement itself is bound.</summary>
+    public bool IsDefined { get; internal set; }
+
+    /// <summary>How deep in try/catch/finally the label sits; jumping inwards is illegal.</summary>
+    public int HandlerDepth { get; internal set; }
+
+    public override string ToString() => Name + ":";
+}
+
 /// <summary>A local slot allocated by the binder; the emitter declares one IL local per slot.</summary>
 public sealed class LocalSymbol(string name, Type type, bool isCompilerGenerated = false)
 {
@@ -31,6 +48,18 @@ public sealed class LocalSymbol(string name, Type type, bool isCompilerGenerated
 
     /// <summary>The scope this variable was declared in; it is the scope that would capture it.</summary>
     internal ClosureScope? DeclaringScope { get; set; }
+
+    /// <summary>
+    /// The value of a <c>const</c>, which is folded into every use rather than stored. Null for
+    /// an ordinary variable, including one that merely happens to be initialised by a literal.
+    /// </summary>
+    public BoundLiteral? ConstantValue { get; internal set; }
+
+    /// <summary>
+    /// The tuple element names this variable was declared with, if any. They exist only at
+    /// compile time — <c>ValueTuple</c> itself knows nothing about them.
+    /// </summary>
+    public IReadOnlyList<string?>? TupleNames { get; internal set; }
 
     /// <summary>Set when some lambda reads this variable; it then lives in a closure, not an IL local.</summary>
     public ClosureScope? Closure { get; internal set; }
@@ -139,7 +168,8 @@ public sealed record BoundConversion(
     SourcePosition Position,
     Type Type,
     BoundExpression Operand,
-    Conversion Conversion) : BoundExpression(Position, Type);
+    Conversion Conversion,
+    bool IsChecked = false) : BoundExpression(Position, Type);
 
 public sealed record BoundBinary(
     SourcePosition Position,
@@ -148,7 +178,8 @@ public sealed record BoundBinary(
     BoundExpression Left,
     BoundExpression Right,
     bool IsLifted,
-    MethodInfo? Method) : BoundExpression(Position, Type);
+    MethodInfo? Method,
+    bool IsChecked = false) : BoundExpression(Position, Type);
 
 public sealed record BoundUnary(
     SourcePosition Position,
@@ -205,11 +236,23 @@ public sealed record BoundIndexerAccess(
     PropertyInfo Indexer,
     IReadOnlyList<BoundExpression> Arguments) : BoundExpression(Position, Indexer.PropertyType);
 
+/// <summary>
+/// <c>a[i]</c>, or <c>a[i, j]</c> for a multi-dimensional array — where the CLR has no
+/// <c>ldelem</c> and the access goes through the array type's own <c>Get</c> / <c>Set</c>.
+/// </summary>
 public sealed record BoundArrayAccess(
     SourcePosition Position,
     Type Type,
     BoundExpression Array,
-    BoundExpression Index) : BoundExpression(Position, Type);
+    IReadOnlyList<BoundExpression> Indices) : BoundExpression(Position, Type)
+{
+    public BoundArrayAccess(SourcePosition position, Type type, BoundExpression array, BoundExpression index)
+        : this(position, type, array, (IReadOnlyList<BoundExpression>)[index])
+    {
+    }
+
+    public bool IsMultiDimensional => Indices.Count > 1;
+}
 
 public sealed record BoundObjectCreation(
     SourcePosition Position,
@@ -222,7 +265,54 @@ public sealed record BoundObjectCreation(
 public sealed record BoundNewArray(
     SourcePosition Position,
     Type ElementType,
-    BoundExpression Length) : BoundExpression(Position, ElementType.MakeArrayType());
+    IReadOnlyList<BoundExpression> Lengths) : BoundExpression(
+        Position,
+        Lengths.Count == 1 ? ElementType.MakeArrayType() : ElementType.MakeArrayType(Lengths.Count));
+
+/// <summary>
+/// <c>(1, "x")</c>. <paramref name="Names"/> is compile-time only and never reaches the IL.
+/// </summary>
+public sealed record BoundTupleLiteral(
+    SourcePosition Position,
+    Type Type,
+    ConstructorInfo Constructor,
+    IReadOnlyList<BoundExpression> Elements,
+    IReadOnlyList<string?> Names) : BoundExpression(Position, Type);
+
+/// <summary>
+/// <c>out var x</c> before resolution has said what type <c>x</c> is. It is replaced by a
+/// <see cref="BoundLocalAddress"/> once the overload is chosen.
+/// </summary>
+public sealed record BoundOutVariable(
+    SourcePosition Position,
+    string Name,
+    Syntax.TypeSyntax? DeclaredType) : BoundExpression(Position, Conversions.OutVariableType);
+
+/// <summary>
+/// A named group of methods that has not been given a delegate type yet. Like a lambda, it only
+/// becomes a value once something says which delegate it converts to.
+/// </summary>
+public sealed record BoundMethodGroup(
+    SourcePosition Position,
+    string Name,
+    BoundExpression? Receiver,
+    IReadOnlyList<MethodInfo> Methods) : BoundExpression(Position, Conversions.MethodGroupType);
+
+/// <summary>
+/// A delegate built from a method group: <c>ldnull</c>/receiver, <c>ldftn</c>, <c>newobj</c>.
+/// </summary>
+public sealed record BoundMethodGroupConversion(
+    SourcePosition Position,
+    Type Type,
+    BoundExpression? Receiver,
+    MethodInfo Method) : BoundExpression(Position, Type);
+
+/// <summary>
+/// The address of a local, for passing it to an <c>out</c> parameter. Only ever produced for
+/// compiler-generated temporaries, which are never captured, so <c>ldloca</c> always applies.
+/// </summary>
+public sealed record BoundLocalAddress(SourcePosition Position, LocalSymbol Local)
+    : BoundExpression(Position, Local.Type.MakeByRefType());
 
 public sealed record BoundArrayCreation(
     SourcePosition Position,
@@ -302,6 +392,11 @@ public sealed record BoundUnboundLambda(
 /// Exactly one of <paramref name="Body"/> and <paramref name="BodyStatement"/> is set,
 /// depending on whether the source wrote an expression or a block.
 /// </summary>
+/// <summary>
+/// A bound lambda. <paramref name="ReturnType"/> is what the IL body returns; for an async
+/// lambda that is the unwrapped value, while <paramref name="DeclaredReturnType"/> is the
+/// <c>Task</c> the method is declared to return and the runtime produces.
+/// </summary>
 public sealed record BoundLambda(
     SourcePosition Position,
     Type Type,
@@ -311,7 +406,9 @@ public sealed record BoundLambda(
     Type ReturnType,
     ClosureScope OwnScope,
     ClosureScope? EnclosingClosure,
-    BoundStatement? BodyStatement = null) : BoundExpression(Position, Type)
+    BoundStatement? BodyStatement = null,
+    bool IsAsync = false,
+    Type? DeclaredReturnType = null) : BoundExpression(Position, Type)
 {
     /// <summary>Index into the host's lambda table; assigned by the emitter.</summary>
     public int Index { get; internal set; } = -1;
@@ -381,12 +478,23 @@ public sealed record BoundReturn(SourcePosition Position, BoundExpression? Expre
 
 public sealed record BoundBreak(SourcePosition Position) : BoundStatement(Position);
 
+public sealed record BoundLabel(SourcePosition Position, LabelSymbol Label) : BoundStatement(Position);
+
+public sealed record BoundGoto(SourcePosition Position, LabelSymbol Label) : BoundStatement(Position);
+
 /// <summary>
 /// A region that <c>break</c> leaves. A <c>switch</c> lowers to one of these wrapped around an
 /// if/else chain; <c>continue</c> inside it still belongs to the enclosing loop.
 /// </summary>
-public sealed record BoundBreakScope(SourcePosition Position, BoundStatement Body)
-    : BoundStatement(Position);
+/// <remarks>
+/// <paramref name="AllPathsReturn"/> is computed by whoever built the scope. The body is a flat
+/// list of labelled sections, so no structural analysis of it could tell whether control can
+/// reach the end — only the builder knows.
+/// </remarks>
+public sealed record BoundBreakScope(
+    SourcePosition Position,
+    BoundStatement Body,
+    bool AllPathsReturn = false) : BoundStatement(Position);
 
 public sealed record BoundContinue(SourcePosition Position) : BoundStatement(Position);
 

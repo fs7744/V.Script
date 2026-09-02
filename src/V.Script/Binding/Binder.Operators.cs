@@ -38,6 +38,8 @@ internal sealed partial class Binder
             };
         }
 
+        if (expression is BoundMethodGroup group) return ConvertMethodGroup(group, target, position);
+
         // A throw expression produces no value, so it simply takes the type asked of it.
         if (expression is BoundThrowExpression thrown) return thrown with { Type = target };
 
@@ -78,7 +80,7 @@ internal sealed partial class Binder
             return new BoundDefault(position, target);
         }
 
-        return new BoundConversion(position, target, expression, conversion);
+        return new BoundConversion(position, target, expression, conversion, _checked);
     }
 
     /// <summary>
@@ -137,13 +139,19 @@ internal sealed partial class Binder
             TypeCode.Char => value is >= char.MinValue and <= char.MaxValue,
             TypeCode.Int64 => true,
             TypeCode.UInt64 => value >= 0,
-            _ => false,
+
+            // nint / nuint have no TypeCode; a constant fits when it would fit the 32-bit form,
+            // which is the range C# guarantees on every platform.
+            _ => targetBase == typeof(nint) ? value is >= int.MinValue and <= int.MaxValue
+                : targetBase == typeof(nuint) && value is >= 0 and <= uint.MaxValue,
         };
 
         if (!fits) return false;
 
-        var converted = System.Convert.ChangeType(
-            literal.Value, targetBase, System.Globalization.CultureInfo.InvariantCulture);
+        var converted = targetBase == typeof(nint) ? (nint)value
+            : targetBase == typeof(nuint) ? (nuint)value
+            : System.Convert.ChangeType(
+                literal.Value, targetBase, System.Globalization.CultureInfo.InvariantCulture);
 
         var narrowed = new BoundLiteral(literal.Position, targetBase, converted);
 
@@ -381,7 +389,8 @@ internal sealed partial class Binder
                 ? typeof(bool)
                 : operandType;
 
-            return new BoundBinary(position, resultType, kind, convertedLeft, convertedRight, lifted, method);
+            return new BoundBinary(
+                position, resultType, kind, convertedLeft, convertedRight, lifted, method, _checked);
         }
 
         var userDefined = FindBinaryOperator(kind, leftBase, rightBase);
@@ -436,7 +445,7 @@ internal sealed partial class Binder
             var bound = new BoundBinary(position, resultType == leftBase ? operandType : resultType, kind,
                 Convert(left, operandType, position, explicitCast: true),
                 Convert(right, operandType, position, explicitCast: true),
-                lifted, null);
+                lifted, null, _checked);
 
             return resultType == operandType || resultType == typeof(bool)
                 ? bound
@@ -454,7 +463,7 @@ internal sealed partial class Binder
         var arithmetic = new BoundBinary(position, operandNumeric, kind,
             Convert(left, operandNumeric, position, explicitCast: true),
             Convert(right, operandNumeric, position, explicitCast: true),
-            lifted, null);
+            lifted, null, _checked);
 
         var enumResultType = lifted ? Conversions.Lift(enumType) : enumType;
         return new BoundConversion(position, enumResultType, arithmetic,
@@ -483,7 +492,7 @@ internal sealed partial class Binder
         return new BoundBinary(position, leftType, kind,
             Convert(left, leftType, position, explicitCast: false),
             Convert(right, rightType, position, explicitCast: false),
-            lifted, null);
+            lifted, null, _checked);
     }
 
     private BoundExpression BindStringConcat(BoundExpression left, BoundExpression right, SourcePosition position)
@@ -737,6 +746,17 @@ internal sealed partial class Binder
 
     private BoundExpression BindAssignment(AssignmentExpressionSyntax syntax)
     {
+        if (syntax.Target is TupleExpressionSyntax tuple)
+        {
+            if (syntax.Operator != SyntaxKind.Equals)
+            {
+                return Fail(syntax.Position, ErrorCode.OperatorNotDefined,
+                    "解构赋值只支持 '='。");
+            }
+
+            return BindTupleAssignment(tuple, syntax.Value);
+        }
+
         var target = BindExpression(syntax.Target);
         if (target is BoundErrorExpression) return target;
 
@@ -831,7 +851,11 @@ internal sealed partial class Binder
                 (property with { Receiver = Capture(property.Receiver) }, sideEffects),
 
             BoundArrayAccess array =>
-                (array with { Array = Capture(array.Array), Index = Capture(array.Index) }, sideEffects),
+                (array with
+                {
+                    Array = Capture(array.Array),
+                    Indices = array.Indices.Select(Capture).ToArray(),
+                }, sideEffects),
 
             BoundIndexerAccess indexer =>
                 (indexer with

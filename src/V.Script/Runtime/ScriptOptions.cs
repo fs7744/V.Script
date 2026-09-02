@@ -22,9 +22,12 @@ public sealed record ScriptOptions
         "System",
         "System.Collections.Generic",
         "System.Linq",
+
+        // Needed to write Task<T> in a delegate type, which an async lambda's target requires.
+        "System.Threading.Tasks",
     ];
 
-    /// <summary>Core BCL references and the usual three imports.</summary>
+    /// <summary>Core BCL references and the usual imports.</summary>
     public static ScriptOptions Default { get; } = new()
     {
         References = CoreReferences.Distinct().ToImmutableArray(),
@@ -34,6 +37,19 @@ public sealed record ScriptOptions
     public ImmutableArray<Assembly> References { get; init; } = [];
 
     public ImmutableArray<string> Imports { get; init; } = [];
+
+    /// <summary>Symbols that <c>#if</c> sees as defined.</summary>
+    public ImmutableArray<string> PreprocessorSymbols { get; init; } = [];
+
+    public ScriptOptions AddPreprocessorSymbols(params ReadOnlySpan<string> symbols)
+    {
+        var builder = PreprocessorSymbols.ToBuilder();
+        foreach (var symbol in symbols)
+            if (!builder.Contains(symbol))
+                builder.Add(symbol);
+
+        return this with { PreprocessorSymbols = builder.ToImmutable() };
+    }
 
     public ScriptOptions AddReferences(params ReadOnlySpan<Assembly> assemblies)
     {

@@ -50,11 +50,16 @@ public static class Conversions
         typeof(sbyte), typeof(byte), typeof(short), typeof(ushort),
         typeof(int), typeof(uint), typeof(long), typeof(ulong),
         typeof(char), typeof(float), typeof(double), typeof(decimal),
+        typeof(nint), typeof(nuint),
     ];
 
     private const int SByteIdx = 0, ByteIdx = 1, ShortIdx = 2, UShortIdx = 3;
     private const int IntIdx = 4, UIntIdx = 5, LongIdx = 6, ULongIdx = 7;
     private const int CharIdx = 8, FloatIdx = 9, DoubleIdx = 10, DecimalIdx = 11;
+
+    // nint / nuint sit between int and long in width, but only at run time — the language
+    // treats them as their own types with the conversions C# gives them.
+    private const int NIntIdx = 12, NUIntIdx = 13;
 
     private static readonly bool[,] ImplicitNumericMatrix = BuildImplicitNumericMatrix();
 
@@ -78,6 +83,17 @@ public static class Conversions
         Allow(CharIdx, UShortIdx, IntIdx, UIntIdx, LongIdx, ULongIdx, FloatIdx, DoubleIdx, DecimalIdx);
         Allow(FloatIdx, DoubleIdx);
 
+        Allow(SByteIdx, NIntIdx);
+        Allow(ByteIdx, NIntIdx, NUIntIdx);
+        Allow(ShortIdx, NIntIdx);
+        Allow(UShortIdx, NIntIdx, NUIntIdx);
+        Allow(IntIdx, NIntIdx);
+        Allow(UIntIdx, NUIntIdx);
+        Allow(CharIdx, NIntIdx, NUIntIdx);
+
+        Allow(NIntIdx, LongIdx, FloatIdx, DoubleIdx, DecimalIdx);
+        Allow(NUIntIdx, ULongIdx, LongIdx, FloatIdx, DoubleIdx, DecimalIdx);
+
         return m;
     }
 
@@ -95,13 +111,15 @@ public static class Conversions
         if (type == typeof(byte)) return ByteIdx;
         if (type == typeof(sbyte)) return SByteIdx;
         if (type == typeof(char)) return CharIdx;
+        if (type == typeof(nint)) return NIntIdx;
+        if (type == typeof(nuint)) return NUIntIdx;
         return -1;
     }
 
     public static bool IsNumeric(Type type) => NumericIndex(type) >= 0;
 
     public static bool IsIntegral(Type type) =>
-        NumericIndex(type) is >= SByteIdx and <= ULongIdx or CharIdx;
+        NumericIndex(type) is >= SByteIdx and <= ULongIdx or CharIdx or NIntIdx or NUIntIdx;
 
     public static bool IsNullableValueType(Type type) =>
         type.IsGenericType && type.GetGenericTypeDefinition() == typeof(Nullable<>);
@@ -274,6 +292,25 @@ public static class Conversions
         private DefaultSentinel() { }
     }
 
+    /// <summary>
+    /// Sentinel for <c>out var x</c>, whose type is whatever the chosen overload's parameter
+    /// turns out to be — so it is not known until after resolution.
+    /// </summary>
+    public static readonly Type OutVariableType = typeof(OutVariableSentinel);
+
+    public sealed class OutVariableSentinel
+    {
+        private OutVariableSentinel() { }
+    }
+
+    /// <summary>Sentinel for a method group before a delegate type is chosen for it.</summary>
+    public static readonly Type MethodGroupType = typeof(MethodGroupSentinel);
+
+    public sealed class MethodGroupSentinel
+    {
+        private MethodGroupSentinel() { }
+    }
+
     /// <summary>Sentinel for a throw expression, which never produces a value at all.</summary>
     public static readonly Type ThrowType = typeof(ThrowSentinel);
 
@@ -289,7 +326,8 @@ public static class Conversions
     /// </summary>
     public static bool IsUntyped(Type type) =>
         type == NullLiteralType || type == LambdaType || type == CollectionType ||
-        type == DefaultLiteralType || type == ThrowType;
+        type == DefaultLiteralType || type == ThrowType || type == OutVariableType ||
+        type == MethodGroupType;
 
     /// <summary>
     /// True for the untyped forms that simply adopt whatever type the context wants, which is
@@ -349,6 +387,35 @@ public static class Conversions
         IsDelegateType(delegateType) ? delegateType.GetMethod("Invoke") : null;
 
     public static bool HasImplicit(Type from, Type to) => Classify(from, to).IsImplicit;
+
+    /// <summary>
+    /// The single type two expressions can both convert to, or null when there is none. This is
+    /// what a conditional's branches, an inferred array's elements, and a type parameter bound
+    /// from several arguments all have to agree on.
+    /// </summary>
+    public static Type? BestCommonType(Type left, Type right)
+    {
+        if (left == right) return left;
+
+        // `default`, a throw expression and a collection expression take whatever the other
+        // side is; they never drive the choice themselves.
+        if (AdoptsTargetType(left)) return AdoptsTargetType(right) ? null : right;
+        if (AdoptsTargetType(right)) return left;
+
+        if (left == NullLiteralType) return IsNullAssignable(right) ? right : Lift(right);
+        if (right == NullLiteralType) return IsNullAssignable(left) ? left : Lift(left);
+
+        var leftToRight = HasImplicit(left, right);
+        var rightToLeft = HasImplicit(right, left);
+
+        if (leftToRight && !rightToLeft) return right;
+        if (rightToLeft && !leftToRight) return left;
+        if (leftToRight && rightToLeft) return left;
+
+        if (IsNumeric(left) && IsNumeric(right)) return NumericPromotion.Promote(left, right);
+
+        return null;
+    }
 
     /// <summary>
     /// Ranks two candidate target types for the same source type, implementing the

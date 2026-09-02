@@ -41,7 +41,7 @@ public static class GenericInference
         {
             var parameterIndex = argumentToParameter[i];
             if (parameterIndex < 0 || parameterIndex >= parameters.Length) return null;
-            if (arguments[i].IsUnboundLambda) continue;
+            if (arguments[i].NeedsTargetType) continue;
 
             Unify(parameters[parameterIndex].ParameterType, arguments[i].Type, bound);
         }
@@ -56,7 +56,7 @@ public static class GenericInference
 
                 for (var i = 0; i < arguments.Count; i++)
                 {
-                    if (!arguments[i].IsUnboundLambda) continue;
+                    if (!arguments[i].NeedsTargetType) continue;
 
                     var parameterIndex = argumentToParameter[i];
                     if (parameterIndex < 0 || parameterIndex >= parameters.Length) continue;
@@ -65,7 +65,10 @@ public static class GenericInference
                     if (invoke is null) continue;
 
                     var lambdaParameters = invoke.GetParameters();
-                    if (lambdaParameters.Length != arguments[i].LambdaArity) continue;
+                    // A method group has no fixed arity of its own; the probe picks the
+                    // overload that matches whatever the delegate asks for.
+                    if (arguments[i].IsUnboundLambda &&
+                        lambdaParameters.Length != arguments[i].LambdaArity) continue;
 
                     var substituted = new Type[lambdaParameters.Length];
                     var closed = true;
@@ -118,7 +121,15 @@ public static class GenericInference
 
         if (parameter.IsGenericParameter)
         {
-            bound.TryAdd(parameter, argument);
+            // Several arguments may bind the same type parameter; they have to agree on one
+            // type, and the best common type is that agreement.
+            if (bound.TryGetValue(parameter, out var existing))
+            {
+                if (Conversions.BestCommonType(existing, argument) is { } common) bound[parameter] = common;
+                return;
+            }
+
+            bound[parameter] = argument;
             return;
         }
 

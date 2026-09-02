@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Reflection.Emit;
 using V.Script.Binding;
 
@@ -46,60 +47,112 @@ internal sealed partial class IlEmitter
     }
 
     /// <summary>
-    /// Emits the script body into <paramref name="il"/> and every lambda into its own
-    /// <see cref="DynamicMethod"/>, returning the table the host uses to build delegates.
+    /// Emits the script body into <paramref name="il"/> and every lambda into a method of its
+    /// own. A synchronous lambda goes into a <see cref="DynamicMethod"/>; an async one needs
+    /// <see cref="MethodImplAttributes.Async"/>, which only a real method can carry, so it goes
+    /// into <paramref name="asyncHost"/> — the same reason the script body has two carriers.
     /// </summary>
-    public static void EmitScript(ILGenerator il, BoundScript script, ScriptHost host)
+    /// <returns>
+    /// The step that publishes the lambda table. It runs after the host type is created, because
+    /// a <see cref="MethodBuilder"/> has no invokable <see cref="MethodInfo"/> before that.
+    /// </returns>
+    public static Action<Type?> EmitScript(
+        ILGenerator il,
+        BoundScript script,
+        ScriptHost host,
+        TypeBuilder? asyncHost = null)
     {
         var lambdas = script.Lambdas;
-        var methods = new DynamicMethod[lambdas.Count];
+        var defined = new LambdaMethod[lambdas.Count];
 
         for (var i = 0; i < lambdas.Count; i++)
         {
             lambdas[i].Index = i;
-            methods[i] = DefineLambdaMethod(lambdas[i], i);
+            defined[i] = DefineLambdaMethod(lambdas[i], i, asyncHost);
         }
 
         new IlEmitter(il, script, null, null).EmitBody();
 
-        var entries = new ScriptHost.LambdaEntry[lambdas.Count];
         for (var i = 0; i < lambdas.Count; i++)
         {
-            var lambda = lambdas[i];
-            var incoming = NearestMaterialized(lambda.EnclosingClosure);
+            var incoming = NearestMaterialized(lambdas[i].EnclosingClosure);
+            new IlEmitter(defined[i].Generator, script, lambdas[i], incoming).EmitBody();
+        }
 
-            new IlEmitter(methods[i].GetILGenerator(), script, lambda, incoming).EmitBody();
+        return createdType => PublishLambdas(script, host, defined, createdType);
+    }
+
+    private static void PublishLambdas(
+        BoundScript script,
+        ScriptHost host,
+        LambdaMethod[] defined,
+        Type? createdType)
+    {
+        var entries = new ScriptHost.LambdaEntry[defined.Length];
+
+        for (var i = 0; i < defined.Length; i++)
+        {
+            var lambda = script.Lambdas[i];
+            var method = defined[i].Resolve(createdType);
+            var incoming = NearestMaterialized(lambda.EnclosingClosure);
 
             // A lambda with nothing to capture always receives the host's shared empty closure,
             // so its delegate can be built once here instead of on every evaluation. A capturing
             // one gets a factory that avoids CreateDelegate on the hot path.
             var shared = incoming is null
-                ? methods[i].CreateDelegate(lambda.Type, host.EmptyClosure)
+                ? method.CreateDelegate(lambda.Type, host.EmptyClosure)
                 : null;
 
             var factory = incoming is null
                 ? null
-                : ClosureBinder.TryCreateFactory(methods[i], lambda.Type);
+                : ClosureBinder.TryCreateFactory(method, lambda.Type);
 
-            entries[i] = new ScriptHost.LambdaEntry(methods[i], lambda.Type, shared, factory);
+            entries[i] = new ScriptHost.LambdaEntry(method, lambda.Type, shared, factory);
         }
 
         host.SetLambdas(entries);
     }
 
-    private static DynamicMethod DefineLambdaMethod(BoundLambda lambda, int index)
+    /// <summary>One lambda's generated method, before the type that holds it exists.</summary>
+    private readonly record struct LambdaMethod(DynamicMethod? Dynamic, MethodBuilder? Builder)
+    {
+        public ILGenerator Generator => Dynamic?.GetILGenerator() ?? Builder!.GetILGenerator();
+
+        public MethodInfo Resolve(Type? createdType) =>
+            Dynamic ?? createdType!.GetMethod(Builder!.Name, BindingFlags.Public | BindingFlags.Static)!;
+    }
+
+    private static LambdaMethod DefineLambdaMethod(BoundLambda lambda, int index, TypeBuilder? asyncHost)
     {
         var parameterTypes = new Type[lambda.Parameters.Count + 1];
         parameterTypes[0] = typeof(ScriptClosure);
         for (var i = 0; i < lambda.Parameters.Count; i++)
             parameterTypes[i + 1] = lambda.Parameters[i].Type;
 
-        return new DynamicMethod(
+        if (!lambda.IsAsync)
+        {
+            return new LambdaMethod(
+                new DynamicMethod(
+                    $"lambda{index}",
+                    lambda.ReturnType,
+                    parameterTypes,
+                    typeof(IlEmitter).Module,
+                    skipVisibility: true),
+                null);
+        }
+
+        // Declared as returning the Task; the IL body returns the unwrapped value and the
+        // runtime does the wrapping, exactly as for an async script body.
+        var builder = asyncHost!.DefineMethod(
             $"lambda{index}",
-            lambda.ReturnType,
-            parameterTypes,
-            typeof(IlEmitter).Module,
-            skipVisibility: true);
+            MethodAttributes.Public | MethodAttributes.Static,
+            lambda.DeclaredReturnType!,
+            parameterTypes);
+
+        builder.SetImplementationFlags(
+            MethodImplAttributes.IL | MethodImplAttributes.Managed | MethodImplAttributes.Async);
+
+        return new LambdaMethod(null, builder);
     }
 
     internal static ClosureScope? NearestMaterialized(ClosureScope? scope)
@@ -231,6 +284,16 @@ internal sealed partial class IlEmitter
                 EmitBreakScope(scope);
                 break;
 
+            case BoundLabel labelled:
+                _il.MarkLabel(LabelFor(labelled.Label));
+                break;
+
+            case BoundGoto jump:
+                // `leave` rather than `br` because the jump may be leaving a protected region,
+                // and it is valid outside one too.
+                _il.Emit(OpCodes.Leave, LabelFor(jump.Label));
+                break;
+
             case BoundBreak:
                 _il.Emit(OpCodes.Leave, _loops.Peek().Break);
                 break;
@@ -299,6 +362,17 @@ internal sealed partial class IlEmitter
     /// inherited from the enclosing loop, so <c>continue</c> inside a switch still means the
     /// loop — when there is no enclosing loop the binder has already rejected it.
     /// </summary>
+    private readonly Dictionary<LabelSymbol, Label> _namedLabels = [];
+
+    private Label LabelFor(LabelSymbol symbol)
+    {
+        if (_namedLabels.TryGetValue(symbol, out var existing)) return existing;
+
+        var label = _il.DefineLabel();
+        _namedLabels[symbol] = label;
+        return label;
+    }
+
     private void EmitBreakScope(BoundBreakScope scope)
     {
         var exit = _il.DefineLabel();

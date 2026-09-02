@@ -33,6 +33,21 @@ public static class NumericPromotion
 
         if (left == typeof(long) || right == typeof(long)) return typeof(long);
 
+        // nint / nuint promote against the smaller integers, and mixing the two has no result —
+        // the same shape as ulong against a signed type.
+        if (left == typeof(nuint) || right == typeof(nuint))
+        {
+            var other = left == typeof(nuint) ? right : left;
+            if (other == typeof(nuint)) return typeof(nuint);
+            return IsSigned(other) || other == typeof(nint) ? null : typeof(nuint);
+        }
+
+        if (left == typeof(nint) || right == typeof(nint))
+        {
+            var other = left == typeof(nint) ? right : left;
+            return other == typeof(uint) ? null : typeof(nint);
+        }
+
         if (left == typeof(uint) || right == typeof(uint))
         {
             var other = left == typeof(uint) ? right : left;
@@ -55,6 +70,8 @@ public static class NumericPromotion
     public static Type? PromoteUnary(Type operand)
     {
         if (!Conversions.IsNumeric(operand)) return null;
+
+        if (operand == typeof(nint) || operand == typeof(nuint)) return operand;
 
         if (operand == typeof(sbyte) || operand == typeof(byte) ||
             operand == typeof(short) || operand == typeof(ushort) ||

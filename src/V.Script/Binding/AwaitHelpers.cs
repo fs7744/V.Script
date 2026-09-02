@@ -37,6 +37,19 @@ internal static class AwaitHelpers
     }
 
     /// <summary>Classifies an awaitable operand, or returns null when the type cannot be awaited.</summary>
+    /// <summary>
+    /// The value behind a <c>Task</c> / <c>Task&lt;T&gt;</c> return type, which is what an async
+    /// body actually produces. Null when the type is not a task at all.
+    /// </summary>
+    public static Type? UnwrapTaskType(Type type)
+    {
+        if (type == typeof(Task)) return typeof(void);
+
+        return type.IsGenericType && type.GetGenericTypeDefinition() == typeof(Task<>)
+            ? type.GetGenericArguments()[0]
+            : null;
+    }
+
     public static (AwaitKind Kind, Type ResultType)? Describe(Type type)
     {
         if (type == typeof(Task)) return (AwaitKind.Task, typeof(void));

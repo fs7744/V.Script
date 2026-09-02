@@ -31,13 +31,6 @@ internal sealed partial class Binder
     {
         var symbols = DeclareLocalFunctions(statements);
 
-        if (symbols.Count == 0)
-        {
-            var plain = new List<BoundStatement>(statements.Count);
-            for (var i = 0; i < statements.Count; i++) plain.Add(bindOne(statements[i], i));
-            return plain;
-        }
-
         var prologue = new List<BoundStatement>(symbols.Count);
         var body = new List<BoundStatement>(statements.Count);
 
@@ -49,6 +42,15 @@ internal sealed partial class Binder
                     prologue.Add(BindLocalFunctionBody(function, symbol));
 
                 continue;
+            }
+
+            // `using var x = e;` has no body of its own: everything after it in the block is
+            // what runs inside the try, so the rest of the list is bound as its body.
+            if (statements[i] is UsingStatementSyntax { Body: null } declaration)
+            {
+                var remaining = statements.Skip(i + 1).ToArray();
+                body.Add(BindUsing(declaration, () => BindStatementList(remaining, bindOne)));
+                break;
             }
 
             body.Add(bindOne(statements[i], i));
@@ -107,9 +109,17 @@ internal sealed partial class Binder
 
     private BoundStatement BindLocalFunctionBody(LocalFunctionStatementSyntax syntax, LocalSymbol symbol)
     {
-        var lambda = new LambdaExpressionSyntax(syntax.Position, syntax.Parameters, syntax.Body);
+        var lambda = new LambdaExpressionSyntax(
+            syntax.Position, syntax.Parameters, syntax.Body, syntax.IsAsync);
+
+        // A static local function may still see its own locals and anything nested inside it;
+        // the boundary is the depth its body starts at.
+        var saved = _staticBoundary;
+        if (syntax.IsStatic) _staticBoundary = _functionDepth + 1;
+
         var bound = BindLambda(lambda, symbol.Type);
 
+        _staticBoundary = saved;
         return new BoundLocalDeclaration(syntax.Position, symbol, bound);
     }
 }

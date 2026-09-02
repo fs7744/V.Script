@@ -34,9 +34,40 @@ internal sealed partial class Binder
     private int _functionDepth;
     private int _loopDepth;
 
+    /// <summary>
+    /// Whether the function being bound can suspend. It starts as the script's own async-ness
+    /// and is replaced per lambda, which is what lets an async lambda live in a sync script.
+    /// </summary>
+    private bool _isAsyncContext;
+
+    /// <summary>
+    /// The function depth a <c>static</c> local function starts at. Reading a variable declared
+    /// outside it is what <c>static</c> forbids, and this is how that boundary is recognised.
+    /// </summary>
+    private int _staticBoundary = -1;
+
     /// <summary>Nesting of <c>switch</c> statements, which <c>break</c> also leaves.</summary>
     private int _switchDepth;
+
+    /// <summary>Labels declared in the function being bound; lambdas get their own set.</summary>
+    private Dictionary<string, LabelSymbol> _labels = [];
+
+    /// <summary>Jumps awaiting validation once every label in the function has been seen.</summary>
+    private List<(LabelSymbol Label, SourcePosition Position, int HandlerDepth)> _pendingGotos = [];
+
+    /// <summary>
+    /// Whether arithmetic in the current region traps on overflow. Scripts are unchecked by
+    /// default, matching the C# compiler's own default.
+    /// </summary>
+    private bool _checked;
     private int _handlerDepth;
+
+    /// <summary>
+    /// Nesting of try / catch / finally regions, counting the try body too. Unlike
+    /// <see cref="_handlerDepth"/> — which is about await — this is what says whether a jump
+    /// would be entering a protected region, which IL forbids.
+    /// </summary>
+    private int _protectedDepth;
     private int _tempCounter;
     private bool _sawReturn;
 
@@ -53,6 +84,7 @@ internal sealed partial class Binder
         _globals = parameters.FirstOrDefault(p => p.IsGlobals);
         _returnType = returnType;
         _isAsync = isAsync;
+        _isAsyncContext = isAsync;
         _scope = new Scope(null);
         _closureScope = _rootScope;
     }
@@ -80,6 +112,8 @@ internal sealed partial class Binder
         statements.AddRange(BindStatementList(
             unit.Statements,
             (statement, i) => BindTopLevelStatement(statement, i == unit.Statements.Count - 1)));
+
+        ValidateGotos();
 
         var body = new BoundBlock(unit.Position, statements,
             _rootScope.IsMaterialized ? _rootScope : null);
@@ -156,6 +190,12 @@ internal sealed partial class Binder
         ContinueStatementSyntax cont => BindContinue(cont),
         ThrowStatementSyntax thr => BindThrow(thr),
         SwitchStatementSyntax switchStatement => BindSwitchStatement(switchStatement),
+        DeconstructionStatementSyntax deconstruction => BindDeconstruction(deconstruction),
+        CheckedStatementSyntax region => BindCheckedRegion(region),
+        LockStatementSyntax locked => BindLock(locked),
+        LabeledStatementSyntax labeled => BindLabeled(labeled),
+        GotoStatementSyntax jump => BindGoto(jump),
+        UsingStatementSyntax usingStatement => BindUsing(usingStatement, static () => []),
 
         // BindStatementList takes these out of the list, so reaching here means one was written
         // where no list exists — as the body of an if or a loop.
@@ -190,6 +230,17 @@ internal sealed partial class Binder
     {
         _scope = saved.Scope;
         _closureScope = saved.Closure;
+    }
+
+    private BoundStatement BindCheckedRegion(CheckedStatementSyntax syntax)
+    {
+        var saved = _checked;
+        _checked = syntax.IsChecked;
+
+        var body = BindBlock(syntax.Body);
+
+        _checked = saved;
+        return body;
     }
 
     private BoundStatement BindBlock(BlockStatementSyntax syntax)
@@ -284,7 +335,28 @@ internal sealed partial class Binder
             declaredType = typeof(object);
         }
 
-        var local = new LocalSymbol(syntax.Name, declaredType);
+        var local = new LocalSymbol(syntax.Name, declaredType)
+        {
+            TupleNames = syntax.Type?.TupleNames
+                ?? (initializer is not null ? TupleNamesOf(initializer) : null),
+        };
+
+        if (syntax.IsConst)
+        {
+            if (initializer is not BoundLiteral constant)
+            {
+                _diagnostics.Report(ErrorCode.CannotInferType, syntax.Position,
+                    $"'const {syntax.Name}' 的初始值必须是编译期常量。");
+                return new BoundNop(syntax.Position);
+            }
+
+            local.ConstantValue = constant;
+            DeclareLocal(local, syntax.Position);
+
+            // A constant has no storage; every use is replaced by its value.
+            return new BoundNop(syntax.Position);
+        }
+
         if (!DeclareLocal(local, syntax.Position)) return new BoundNop(syntax.Position);
 
         return new BoundLocalDeclaration(syntax.Position, local, initializer);
@@ -448,7 +520,9 @@ internal sealed partial class Binder
 
     private BoundStatement BindTry(TryStatementSyntax syntax)
     {
+        _protectedDepth++;
         var body = BindStatement(syntax.Body);
+        _protectedDepth--;
 
         var catches = new List<BoundCatchClause>();
         foreach (var clause in syntax.Catches)
@@ -475,7 +549,9 @@ internal sealed partial class Binder
             }
 
             _handlerDepth++;
+            _protectedDepth++;
             var clauseBody = BindStatement(clause.Body);
+            _protectedDepth--;
             _handlerDepth--;
 
             PopScope(saved);
@@ -490,7 +566,9 @@ internal sealed partial class Binder
         if (syntax.Finally is not null)
         {
             _handlerDepth++;
+            _protectedDepth++;
             finallyBlock = BindStatement(syntax.Finally);
+            _protectedDepth--;
             _handlerDepth--;
         }
 
@@ -779,7 +857,8 @@ internal sealed partial class Binder
     private static bool AlwaysReturns(BoundStatement statement) => statement switch
     {
         BoundReturn => true,
-        BoundBreakScope scope => AlwaysReturns(scope.Body),
+        BoundLabel => false,
+        BoundBreakScope scope => scope.AllPathsReturn,
         BoundThrow => true,
         BoundBlock block => block.Statements.Any(AlwaysReturns),
         BoundIf { Else: not null } conditional =>

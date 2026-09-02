@@ -59,6 +59,7 @@ public enum ErrorCode
     AwaitInExceptionHandler = 3004,
     NotAllCodePathsReturn = 3005,
     SwitchSectionFallsThrough = 3006,
+    UseOfUnassignedVariable = 3007,
 
     // ---- 9xxx not implemented ----
     GenericMethodInferenceNotSupported = 9002,

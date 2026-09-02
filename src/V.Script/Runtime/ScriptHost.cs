@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Reflection;
 using System.Reflection.Emit;
 
 namespace V.Script;
@@ -38,7 +39,7 @@ public sealed class ScriptHost
     internal void SetLambdas(LambdaEntry[] lambdas) => _lambdas = lambdas;
 
     internal readonly record struct LambdaEntry(
-        DynamicMethod Method,
+        MethodInfo Method,
         Type DelegateType,
         Delegate? Shared,
         Func<ScriptClosure, Delegate>? Factory);

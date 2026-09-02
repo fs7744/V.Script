@@ -28,6 +28,7 @@ BenchmarkSwitcher
         typeof(InterpolationBenchmarks),
         typeof(InitializerBenchmarks),
         typeof(LocalFunctionBenchmarks),
+        typeof(TupleBenchmarks),
         typeof(CarrierExecutionBenchmarks),
         typeof(CarrierCompilationBenchmarks),
     ])

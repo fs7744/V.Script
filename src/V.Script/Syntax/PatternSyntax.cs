@@ -55,6 +55,34 @@ public sealed record PropertyPatternSyntax(
     IReadOnlyList<PropertySubpatternSyntax> Subpatterns,
     string? Designation) : PatternSyntax(Position);
 
+/// <summary>
+/// <c>(a, b)</c> or <c>Point (var x, var y)</c>: the value is deconstructed and each part is
+/// matched in turn. An element may be named, as in <c>(x: 1, y: 2)</c>.
+/// </summary>
+public sealed record PositionalPatternSyntax(
+    SourcePosition Position,
+    TypeSyntax? Type,
+    IReadOnlyList<PositionalSubpatternSyntax> Subpatterns,
+    IReadOnlyList<PropertySubpatternSyntax> Properties,
+    string? Designation) : PatternSyntax(Position);
+
+public sealed record PositionalSubpatternSyntax(
+    SourcePosition Position,
+    string? Name,
+    PatternSyntax Pattern) : SyntaxNode(Position);
+
+/// <summary>
+/// <c>[1, 2]</c>, <c>[1, .., 3]</c>, <c>[first, ..var rest]</c>. At most one slice is allowed,
+/// and it is what makes the pattern match a range of lengths rather than exactly one.
+/// </summary>
+public sealed record ListPatternSyntax(
+    SourcePosition Position,
+    IReadOnlyList<PatternSyntax> Before,
+    bool HasSlice,
+    string? SliceDesignation,
+    IReadOnlyList<PatternSyntax> After,
+    string? Designation) : PatternSyntax(Position);
+
 /// <summary>Placeholder produced after a parse error so parsing can continue.</summary>
 public sealed record ErrorPatternSyntax(SourcePosition Position) : PatternSyntax(Position);
 

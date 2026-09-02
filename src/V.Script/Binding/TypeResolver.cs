@@ -27,6 +27,8 @@ public sealed class TypeResolver
             ["long"] = typeof(long),
             ["ulong"] = typeof(ulong),
             ["short"] = typeof(short),
+            ["nint"] = typeof(nint),
+            ["nuint"] = typeof(nuint),
             ["ushort"] = typeof(ushort),
             ["object"] = typeof(object),
             ["string"] = typeof(string),
@@ -77,12 +79,19 @@ public sealed class TypeResolver
 
         if (syntax.IsNullable)
         {
-            if (!type.IsValueType || Conversions.IsNullableValueType(type)) return null;
-            type = typeof(Nullable<>).MakeGenericType(type);
+            // On a value type `T?` is Nullable<T>. On a reference type it is only an annotation
+            // for a nullability analysis the engine does not perform, so it is accepted and
+            // dropped rather than rejected — writing `string?` should not fail to compile.
+            if (type.IsValueType && !Conversions.IsNullableValueType(type))
+                type = typeof(Nullable<>).MakeGenericType(type);
         }
 
-        for (var i = 0; i < syntax.ArrayRank; i++)
-            type = type.MakeArrayType();
+        // Bracket groups apply outermost-first, and each may be multi-dimensional.
+        for (var i = syntax.ArrayRank - 1; i >= 0; i--)
+        {
+            var dimensions = syntax.DimensionsAt(i);
+            type = dimensions == 1 ? type.MakeArrayType() : type.MakeArrayType(dimensions);
+        }
 
         return type;
     }
