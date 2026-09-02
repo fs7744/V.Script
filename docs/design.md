@@ -572,7 +572,7 @@ dotnet run --project bench/V.Script.Benchmarks -c Release -- --filter "*"
 其中明确赋值分析约占中等脚本的 4%（关掉它是 29.6 µs）。它按语句遍历绑定后的树，用的是持久化
 集合而不是每次赋值拷贝一份——先用 `HashSet` 写时代价是 34%，换成 `ImmutableHashSet` 后降到 4%。
 
-异步比同步贵约 70 倍，全部来自 collectible 程序集的创建与卸载。这就是 `DynamicMethod` 无法
+异步比同步贵约 40 倍，全部来自 collectible 程序集的创建与卸载。这就是 `DynamicMethod` 无法
 标记 `Async` 这一个 API 缺口的全部代价。
 
 ---
