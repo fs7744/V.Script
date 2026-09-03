@@ -31,7 +31,8 @@ internal static class ScriptCarrier
         Type[] scriptParameterTypes,
         Type ilReturnType,
         ScriptHost host,
-        string name)
+        string name,
+        GeneratedAssemblyPool pool)
     {
         var signature = BuildSignature(scriptParameterTypes);
 
@@ -44,19 +45,16 @@ internal static class ScriptCarrier
 
         // Only async lambdas need somewhere real to live; a script without them costs nothing.
         var needsAssembly = script.Lambdas.Any(l => l.IsAsync);
+        var lease = needsAssembly ? pool.Define($"{name}.Lambdas") : null;
 
-        AssemblyBuilder? assembly = null;
-        TypeBuilder? lambdaHost = null;
+        var publish = IlEmitter.EmitScript(method.GetILGenerator(), script, host, lease?.Builder);
 
-        if (needsAssembly) (assembly, lambdaHost) = DefineGeneratedType($"{name}.Lambdas");
-
-        var publish = IlEmitter.EmitScript(method.GetILGenerator(), script, host, lambdaHost);
-
-        var created = lambdaHost?.CreateType();
+        var created = lease?.Builder.CreateType();
         publish(created);
 
-        var owner = created is null ? null : new GeneratedAssembly(assembly!, created);
-        return (method.CreateDelegate(delegateType, host), owner);
+        if (created is not null) lease!.Publish(created);
+
+        return (method.CreateDelegate(delegateType, host), lease);
     }
 
     public static (Delegate Invoke, IDisposable? Owner) CompileAsynchronous(
@@ -65,7 +63,8 @@ internal static class ScriptCarrier
         Type[] scriptParameterTypes,
         Type ilReturnType,
         ScriptHost host,
-        string name)
+        string name,
+        GeneratedAssemblyPool pool)
     {
         var signature = BuildSignature(scriptParameterTypes);
 
@@ -75,7 +74,8 @@ internal static class ScriptCarrier
             ? typeof(Task)
             : typeof(Task<>).MakeGenericType(ilReturnType);
 
-        var (assembly, type) = DefineGeneratedType(name);
+        var lease = pool.Define(name);
+        var type = lease.Builder;
 
         var method = type.DefineMethod(
             "Run",
@@ -91,23 +91,12 @@ internal static class ScriptCarrier
 
         var created = type.CreateType()!;
         publish(created);
+        lease.Publish(created);
 
         var runtimeMethod = created.GetMethod("Run", BindingFlags.Public | BindingFlags.Static)!;
 
         var invoke = runtimeMethod.CreateDelegate(delegateType, host);
-        return (invoke, new GeneratedAssembly(assembly, created));
-    }
-
-    private static (AssemblyBuilder Assembly, TypeBuilder Type) DefineGeneratedType(string name)
-    {
-        var assemblyName = new AssemblyName($"V.Script.Generated.{name}");
-        var assembly = AssemblyBuilder.DefineDynamicAssembly(assemblyName, AssemblyBuilderAccess.RunAndCollect);
-
-        var type = assembly
-            .DefineDynamicModule("M")
-            .DefineType("Script", TypeAttributes.Public | TypeAttributes.Abstract | TypeAttributes.Sealed);
-
-        return (assembly, type);
+        return (invoke, lease);
     }
 
     private static Type[] BuildSignature(Type[] scriptParameterTypes)
@@ -117,21 +106,4 @@ internal static class ScriptCarrier
         return [.. signature];
     }
 
-    /// <summary>
-    /// Keeps the generated assembly reachable for as long as the script is alive. Dropping this
-    /// (plus the delegate) is what lets the runtime unload that one script's code.
-    /// </summary>
-    private sealed class GeneratedAssembly(AssemblyBuilder assembly, Type type) : IDisposable
-    {
-        private AssemblyBuilder? _assembly = assembly;
-        private Type? _type = type;
-
-        public void Dispose()
-        {
-            _assembly = null;
-            _type = null;
-        }
-
-        public override string ToString() => _type?.Assembly.FullName ?? "<unloaded>";
-    }
 }

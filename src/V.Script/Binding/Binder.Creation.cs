@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text;
 using V.Script.Diagnostics;
 using V.Script.Syntax;
@@ -238,8 +239,10 @@ internal sealed partial class Binder
         if (target.IsArray) return array;
         if (target.IsInterface) return Convert(array, target, syntax.Position, explicitCast: false);
 
-        var constructor = target.GetConstructor(Type.EmptyTypes)!;
-        var creation = new BoundObjectCreation(syntax.Position, constructor, []);
+        var (constructor, constructorArguments) =
+            CollectionConstructor(target, elements.Length, syntax.Position);
+
+        var creation = new BoundObjectCreation(syntax.Position, constructor, constructorArguments);
 
         var temp = MakeTemp(target);
         var receiver = new BoundLocalAccess(syntax.Position, temp);
@@ -257,6 +260,28 @@ internal sealed partial class Binder
         }
 
         return new BoundSequence(syntax.Position, target, effects, receiver);
+    }
+
+    /// <summary>
+    /// The constructor to build the collection with: the parameterless one, or <c>List&lt;T&gt;</c>'s
+    /// capacity constructor when the element count is known up front.
+    /// </summary>
+    /// <remarks>
+    /// Only <c>List&lt;T&gt;</c> is special-cased. An <c>(int)</c> constructor means capacity there;
+    /// on some other collection it could mean anything, and guessing would be a silent bug.
+    /// Without it, <c>[1, 2, 3, 4]</c> allocates a backing array and then grows it.
+    /// </remarks>
+    private static (ConstructorInfo Constructor, IReadOnlyList<BoundExpression> Arguments) CollectionConstructor(
+        Type target, int count, SourcePosition position)
+    {
+        if (target.IsGenericType &&
+            target.GetGenericTypeDefinition() == typeof(List<>) &&
+            target.GetConstructor([typeof(int)]) is { } withCapacity)
+        {
+            return (withCapacity, [new BoundLiteral(position, typeof(int), count)]);
+        }
+
+        return (target.GetConstructor(Type.EmptyTypes)!, []);
     }
 
     /// <summary>
@@ -517,7 +542,8 @@ internal sealed partial class Binder
         var needsFormat = parts.Any(p => p.IsHole && (p.Alignment is not null || p.Format is not null));
 
         return needsFormat
-            ? BindInterpolationAsFormat(syntax.Position, parts)
+            ? BindInterpolationAsHandler(syntax.Position, parts)
+              ?? BindInterpolationAsFormat(syntax.Position, parts)
             : BindInterpolationAsConcat(syntax.Position, parts);
     }
 
@@ -577,6 +603,120 @@ internal sealed partial class Binder
         return typeof(string).GetMethod(
             nameof(string.Concat), [.. Enumerable.Repeat(parameterType, count)]);
     }
+
+    /// <summary>
+    /// Lowers an interpolation that has alignment or format specifiers the way the C# compiler
+    /// does: into a <see cref="DefaultInterpolatedStringHandler"/> built up call by call.
+    /// </summary>
+    /// <remarks>
+    /// The alternative, <c>string.Format</c>, has to parse the composite format string at run
+    /// time and boxes every hole. The handler does neither — it calls a generic
+    /// <c>AppendFormatted&lt;T&gt;</c> per hole and writes into a pooled buffer.
+    /// <para>
+    /// Returns null when the handler cannot express this interpolation — an alignment that is
+    /// not an integer, or a runtime whose handler has a different shape — and the caller falls
+    /// back to <c>string.Format</c>.
+    /// </para>
+    /// </remarks>
+    private BoundExpression? BindInterpolationAsHandler(SourcePosition position, List<InterpolationPart> parts)
+    {
+        var handlerType = typeof(DefaultInterpolatedStringHandler);
+
+        var constructor = handlerType.GetConstructor([typeof(int), typeof(int)]);
+        var appendLiteral = handlerType.GetMethod(nameof(DefaultInterpolatedStringHandler.AppendLiteral),
+            [typeof(string)]);
+        var toStringAndClear = handlerType.GetMethod(
+            nameof(DefaultInterpolatedStringHandler.ToStringAndClear), Type.EmptyTypes);
+
+        if (constructor is null || appendLiteral is null || toStringAndClear is null) return null;
+
+        var literalLength = 0;
+        var holeCount = 0;
+
+        foreach (var part in parts)
+        {
+            if (part.IsHole) holeCount++;
+            else literalLength += part.Text!.Length;
+        }
+
+        // The handler is a ref struct held in a local; every call takes its address.
+        var handler = new BoundLocalAccess(position, MakeTemp(handlerType));
+
+        var effects = new List<BoundExpression>
+        {
+            new BoundAssignment(position, handler, new BoundObjectCreation(position, constructor,
+            [
+                new BoundLiteral(position, typeof(int), literalLength),
+                new BoundLiteral(position, typeof(int), holeCount),
+            ])),
+        };
+
+        foreach (var part in parts)
+        {
+            if (!part.IsHole)
+            {
+                if (part.Text!.Length == 0) continue;
+
+                effects.Add(new BoundCall(position, handler, appendLiteral,
+                    [new BoundLiteral(position, typeof(string), part.Text)]));
+                continue;
+            }
+
+            int? alignment = null;
+            if (part.Alignment is { Length: > 0 } text)
+            {
+                if (!int.TryParse(text, out var parsed)) return null;
+                alignment = parsed;
+            }
+
+            var append = FindAppendFormatted(handlerType, alignment is not null, part.Format is not null);
+            if (append is null) return null;
+
+            var value = part.Value!;
+            if (value.Type == typeof(void) || !CanBeGenericArgument(value.Type)) return null;
+
+            var arguments = new List<BoundExpression> { value };
+            if (alignment is not null) arguments.Add(new BoundLiteral(position, typeof(int), alignment.Value));
+            if (part.Format is not null) arguments.Add(new BoundLiteral(position, typeof(string), part.Format));
+
+            effects.Add(new BoundCall(position, handler, append.MakeGenericMethod(value.Type), arguments));
+        }
+
+        var result = new BoundCall(position, handler, toStringAndClear, []);
+        return new BoundSequence(position, typeof(string), effects, result);
+    }
+
+    /// <summary>
+    /// The <c>AppendFormatted&lt;T&gt;</c> overload taking a value plus, optionally, an alignment
+    /// and a format string — matched by shape rather than by a hard-coded signature, because the
+    /// set of overloads is a runtime detail.
+    /// </summary>
+    private static MethodInfo? FindAppendFormatted(Type handlerType, bool hasAlignment, bool hasFormat)
+    {
+        var wanted = 1 + (hasAlignment ? 1 : 0) + (hasFormat ? 1 : 0);
+
+        foreach (var method in MemberCache.MethodsNamed(handlerType, InstanceFlags,
+                     nameof(DefaultInterpolatedStringHandler.AppendFormatted)))
+        {
+            if (!method.IsGenericMethodDefinition) continue;
+            if (method.GetGenericArguments().Length != 1) continue;
+
+            var parameters = MemberCache.ParametersOf(method);
+            if (parameters.Length != wanted) continue;
+            if (!parameters[0].ParameterType.IsGenericParameter) continue;
+
+            if (hasAlignment && parameters[1].ParameterType != typeof(int)) continue;
+            if (hasFormat && parameters[^1].ParameterType != typeof(string)) continue;
+
+            return method;
+        }
+
+        return null;
+    }
+
+    /// <summary>Whether a type can stand in for a generic parameter at all.</summary>
+    private static bool CanBeGenericArgument(Type type) =>
+        !type.IsByRef && !type.IsByRefLike && !type.IsPointer && type != typeof(void);
 
     private BoundExpression BindInterpolationAsFormat(SourcePosition position, List<InterpolationPart> parts)
     {

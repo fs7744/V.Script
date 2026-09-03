@@ -12,7 +12,11 @@ namespace V.Script.Benchmarks;
 public class CompilationBenchmarks
 {
     private ScriptEngine _engine = null!;
+    private ScriptEngine _batched = null!;
     private int _counter;
+
+    /// <summary>How many scripts share a generated assembly in the batched engine.</summary>
+    private const int BatchSize = 16;
 
     private const string SmallSource = "Price * Quantity";
 
@@ -36,14 +40,20 @@ public class CompilationBenchmarks
     public void Setup()
     {
         _engine = new ScriptEngine(ScriptOptions.Default);
+        _batched = new ScriptEngine(ScriptOptions.Default with { ScriptsPerGeneratedAssembly = BatchSize });
 
         // Warm the reflection caches so the first measured iteration is not an outlier.
         _engine.Compile<PricingContext, decimal>(Unique(SmallSource)).Dispose();
         _engine.CompileAsync<AsyncContext, int>(Unique("Seed")).Dispose();
+        _batched.CompileAsync<AsyncContext, int>(Unique("Seed")).Dispose();
     }
 
     [GlobalCleanup]
-    public void Cleanup() => _engine.Dispose();
+    public void Cleanup()
+    {
+        _engine.Dispose();
+        _batched.Dispose();
+    }
 
     /// <summary>Appending a unique comment keeps every iteration a genuine cache miss.</summary>
     private string Unique(string source) => $"{source} // {Interlocked.Increment(ref _counter)}";
@@ -63,6 +73,29 @@ public class CompilationBenchmarks
     [Benchmark(Description = "async, loop with await (collectible assembly)")]
     public void CompileAsyncLoop() =>
         _engine.CompileAsync<AsyncContext, int>(Unique(AsyncLoopSource)).Dispose();
+
+    /// <summary>
+    /// The same small asynchronous script, but with sixteen of them sharing one generated
+    /// assembly. Creating the assembly is nearly the whole cost, and it is charged per assembly,
+    /// so this is what the per-script price becomes once it is amortised.
+    /// </summary>
+    /// <remarks>
+    /// Retiring the script immediately, as the other rows do, would defeat the point: the
+    /// generation would be full and gone before the next iteration reuses it. These are kept
+    /// until a whole batch has been compiled, which is the usage the setting exists for.
+    /// </remarks>
+    [Benchmark(Description = "async, small (16 scripts per assembly)")]
+    public void CompileSmallAsyncBatched()
+    {
+        _batch.Add(_batched.CompileAsync<AsyncContext, int>(Unique("Seed")));
+
+        if (_batch.Count < BatchSize) return;
+
+        foreach (var script in _batch) script.Dispose();
+        _batch.Clear();
+    }
+
+    private readonly List<IDisposable> _batch = [];
 }
 
 /// <summary>Separated out so the cache hit is not measured against a churning engine.</summary>

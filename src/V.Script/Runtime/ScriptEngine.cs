@@ -19,6 +19,7 @@ public sealed class ScriptEngine : IDisposable
 {
     private readonly ScriptOptions _options;
     private readonly TypeResolver _resolver;
+    private readonly GeneratedAssemblyPool _assemblies;
     private readonly ConcurrentDictionary<CacheKey, ICompiledScript> _cache = new();
     private int _disposed;
 
@@ -29,6 +30,7 @@ public sealed class ScriptEngine : IDisposable
         ArgumentNullException.ThrowIfNull(options);
         _options = options;
         _resolver = new TypeResolver(options.References, options.Imports);
+        _assemblies = new GeneratedAssemblyPool(options.ScriptsPerGeneratedAssembly);
     }
 
     public ScriptOptions Options => _options;
@@ -67,7 +69,8 @@ public sealed class ScriptEngine : IDisposable
             [typeof(TGlobals)],
             typeof(TResult),
             host,
-            host.SourceName);
+            host.SourceName,
+            _assemblies);
 
         var script = new Script<TGlobals, TResult>(
             source,
@@ -114,7 +117,8 @@ public sealed class ScriptEngine : IDisposable
             [typeof(TGlobals)],
             typeof(TResult),
             host,
-            host.SourceName);
+            host.SourceName,
+            _assemblies);
 
         var script = new AsyncScript<TGlobals, TResult>(
             source,
@@ -156,7 +160,8 @@ public sealed class ScriptEngine : IDisposable
         if (bound is null) throw new ScriptCompilationException(diagnostics);
 
         var (invoke, _) = ScriptCarrier.CompileSynchronous(
-            bound, typeof(TDelegate), parameterTypes, invokeMethod.ReturnType, host, host.SourceName);
+            bound, typeof(TDelegate), parameterTypes, invokeMethod.ReturnType, host, host.SourceName,
+            _assemblies);
 
         return (TDelegate)invoke;
     }
@@ -192,7 +197,8 @@ public sealed class ScriptEngine : IDisposable
         if (bound is null) throw new ScriptCompilationException(diagnostics);
 
         var (invoke, owner) = ScriptCarrier.CompileAsynchronous(
-            bound, typeof(TDelegate), parameterTypes, ilReturnType, host, host.SourceName);
+            bound, typeof(TDelegate), parameterTypes, ilReturnType, host, host.SourceName,
+            _assemblies);
 
         return new ScriptDelegate<TDelegate>((TDelegate)invoke, owner, diagnostics);
     }

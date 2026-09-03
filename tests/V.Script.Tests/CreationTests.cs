@@ -335,6 +335,59 @@ public sealed class InterpolationTests : ScriptTest
     }
 
     [Fact]
+    public void Format_specifier_inside_a_lambda()
+    {
+        using var _ = new InvariantCulture();
+
+        // The handler is a ref struct in a local, so this checks it also works inside a lambda's
+        // own generated method, not just in the script body.
+        const string source = """
+            return string.Join("|", Numbers.Select(n => $"{n,3:D2}"));
+            """;
+
+        var globals = new OrderGlobals { Numbers = [3, 4] };
+        Assert.Equal($"{3,3:D2}|{4,3:D2}", Run<OrderGlobals, string>(source, globals));
+    }
+
+    [Fact]
+    public void More_holes_with_formats_than_any_fixed_overload_takes()
+    {
+        using var _ = new InvariantCulture();
+
+        var g = new NumberGlobals { A = 1, B = 2, D = 3, Small = 4, U = 5, Ch = 'x' };
+        Assert.Equal(
+            $"{g.A,3}{g.B,-3}{g.D:F1}{g.Small,2}{g.U}{g.Ch,2}",
+            Run<NumberGlobals, string>("return $\"{A,3}{B,-3}{D:F1}{Small,2}{U}{Ch,2}\";", g));
+    }
+
+    [Fact]
+    public void Alignment_on_a_string_hole()
+    {
+        var globals = new NumberGlobals { Text = "ab" };
+        Assert.Equal(
+            $"[{globals.Text,5}][{globals.Text,-5}]",
+            Run<NumberGlobals, string>("return $\"[{Text,5}][{Text,-5}]\";", globals));
+    }
+
+    [Fact]
+    public void A_null_hole_with_alignment_pads_to_empty()
+    {
+        var globals = new NumberGlobals { Text = null };
+        Assert.Equal($"[{globals.Text,4}]", Run<NumberGlobals, string>("return $\"[{Text,4}]\";", globals));
+    }
+
+    [Fact]
+    public void The_same_value_may_appear_with_different_formats()
+    {
+        using var _ = new InvariantCulture();
+
+        var globals = new NumberGlobals { D = 2.5 };
+        Assert.Equal(
+            $"{globals.D:F0}/{globals.D:F3}",
+            Run<NumberGlobals, string>("return $\"{D:F0}/{D:F3}\";", globals));
+    }
+
+    [Fact]
     public void Interpolation_inside_a_lambda()
     {
         const string source = """

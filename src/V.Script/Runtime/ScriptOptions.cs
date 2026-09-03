@@ -41,6 +41,30 @@ public sealed record ScriptOptions
     /// <summary>Symbols that <c>#if</c> sees as defined.</summary>
     public ImmutableArray<string> PreprocessorSymbols { get; init; } = [];
 
+    /// <summary>
+    /// How many scripts share one generated assembly. The default, 1, gives every script its own.
+    /// </summary>
+    /// <remarks>
+    /// Only asynchronous scripts and synchronous scripts containing an <c>async</c> lambda need a
+    /// generated assembly at all; everything else is a <c>DynamicMethod</c> and is unaffected.
+    /// <para>
+    /// Creating a collectible assembly is nearly all of what an asynchronous compile costs, and
+    /// it is charged per assembly rather than per script, so raising this amortises it — at the
+    /// price of unloading granularity. With the default, disposing a script reclaims its code
+    /// immediately. With a larger value, an assembly is only reclaimed once every script sharing
+    /// it has been disposed, so one long-lived script keeps its whole batch resident. Raise it
+    /// when scripts are compiled and retired in batches; leave it alone when their lifetimes are
+    /// independent.
+    /// </para>
+    /// </remarks>
+    public int ScriptsPerGeneratedAssembly
+    {
+        get;
+        init => field = value >= 1
+            ? value
+            : throw new ArgumentOutOfRangeException(nameof(value), value, "每个程序集至少要放一个脚本。");
+    } = 1;
+
     public ScriptOptions AddPreprocessorSymbols(params ReadOnlySpan<string> symbols)
     {
         var builder = PreprocessorSymbols.ToBuilder();
