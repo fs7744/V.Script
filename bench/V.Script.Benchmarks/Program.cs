@@ -29,6 +29,8 @@ BenchmarkSwitcher
         typeof(InitializerBenchmarks),
         typeof(LocalFunctionBenchmarks),
         typeof(TupleBenchmarks),
+        typeof(ClosureBindingBenchmarks),
+        typeof(ClosureSlotBenchmarks),
         typeof(CarrierExecutionBenchmarks),
         typeof(CarrierCompilationBenchmarks),
     ])

@@ -89,6 +89,12 @@ public sealed class ClosureScope(ClosureScope? parent)
     /// <summary>False when nothing was captured here, in which case no instance is created.</summary>
     public bool IsMaterialized => _slots.Count > 0;
 
+    /// <summary>
+    /// The concrete <see cref="ScriptClosure"/> subclass this scope instantiates, memoised by the
+    /// emitter once the slot list is final.
+    /// </summary>
+    internal Type? RuntimeType { get; set; }
+
     /// <summary>The nearest enclosing scope that does get an instance, or null.</summary>
     public ClosureScope? MaterializedParent
     {

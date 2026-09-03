@@ -193,10 +193,9 @@ internal sealed partial class IlEmitter
             {
                 if (!parameter.IsCaptured) continue;
 
-                EmitCapturedSlotAddress(parameter);
+                var typed = EmitSlotStoreTarget(parameter);
                 EmitLdarg(parameter.LambdaArgIndex);
-                if (parameter.Type.IsValueType) _il.Emit(OpCodes.Box, parameter.Type);
-                _il.Emit(OpCodes.Stelem_Ref);
+                EmitSlotStore(parameter, typed);
             }
         }
 
@@ -322,13 +321,12 @@ internal sealed partial class IlEmitter
 
         if (local.IsCaptured)
         {
-            EmitCapturedSlotAddress(local);
+            var typed = EmitSlotStoreTarget(local);
 
             if (declaration.Initializer is null) EmitDefaultValue(local.Type);
             else EmitExpression(declaration.Initializer);
 
-            if (local.Type.IsValueType) _il.Emit(OpCodes.Box, local.Type);
-            _il.Emit(OpCodes.Stelem_Ref);
+            EmitSlotStore(local, typed);
             return;
         }
 
@@ -488,9 +486,9 @@ internal sealed partial class IlEmitter
             {
                 var pending = _il.DeclareLocal(clause.Variable.Type);
                 _il.Emit(OpCodes.Stloc, pending);
-                EmitCapturedSlotAddress(clause.Variable);
+                var typed = EmitSlotStoreTarget(clause.Variable);
                 _il.Emit(OpCodes.Ldloc, pending);
-                _il.Emit(OpCodes.Stelem_Ref);
+                EmitSlotStore(clause.Variable, typed);
             }
             else
             {

@@ -19,7 +19,7 @@ public sealed class ScriptHost
     internal ScriptHost(string sourceName)
     {
         SourceName = sourceName;
-        EmptyClosure = new ScriptClosure(this, null, 0);
+        EmptyClosure = new ArrayClosure(this, null, 0);
     }
 
     public string SourceName { get; }

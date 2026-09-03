@@ -7,10 +7,19 @@ namespace V.Script;
 /// Turns a lambda's generated method into a delegate bound to a live closure.
 /// </summary>
 /// <remarks>
-/// The obvious implementation, calling <c>DynamicMethod.CreateDelegate(type, closure)</c> on
-/// every evaluation, costs several hundred nanoseconds — enough to dominate a rule that uses a
-/// capturing lambda. Instead the open delegate (closure as its first argument) is built once at
-/// compile time, and binding becomes an ordinary C# closure allocation.
+/// The obvious implementation, calling <c>CreateDelegate(type, closure)</c> on every evaluation,
+/// costs around 400 ns — enough to dominate a rule that uses a capturing lambda. Instead the
+/// open delegate (closure as its first argument) is built once at compile time, and binding
+/// becomes an ordinary C# closure allocation: 15 ns.
+/// <para>
+/// Two things about that measurement are worth knowing before anyone tries to simplify this
+/// away (<c>ClosureBindingBenchmarks</c> has the numbers). It is not JIT warm-up — the method
+/// has already been bound once and is compiled, and an ordinary method in a real assembly costs
+/// the same, so the price is in <see cref="Delegate.CreateDelegate(Type, object, MethodInfo)"/>
+/// itself. And the extra hop this wrapper adds is not a cost: binding the closure into a static
+/// method's first argument needs a shuffle thunk, which makes the "direct" delegate slower to
+/// invoke than the two cheap calls it replaces.
+/// </para>
 /// <para>
 /// Only <see cref="Func{TResult}"/> and <see cref="Action"/> shapes up to three parameters are
 /// specialised; anything else falls back to <c>CreateDelegate</c>, which is always correct.

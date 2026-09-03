@@ -544,3 +544,90 @@ public sealed class BlockLambdaTests : ScriptTest
         Assert.Equal(123, Run<LambdaGlobals, int>(source, globals));
     }
 }
+
+/// <summary>
+/// Closure slot layout. Up to four captured variables get a typed layout with a field each;
+/// past that the engine falls back to boxing everything into an <c>object[]</c>. The boundary
+/// is invisible from the language, so these check that it stays that way.
+/// </summary>
+public sealed class ClosureLayoutTests : ScriptTest
+{
+    [Fact]
+    public void One_captured_variable()
+    {
+        Assert.Equal(7, Eval<int>("var a = 7; var f = () => a; return f();"));
+    }
+
+    [Fact]
+    public void Four_captured_variables_the_last_typed_layout()
+    {
+        const string source = """
+            var a = 1; var b = 20; var c = 300; var d = 4000;
+            var f = () => a + b + c + d;
+            return f();
+            """;
+
+        Assert.Equal(4321, Eval<int>(source));
+    }
+
+    [Fact]
+    public void Five_captured_variables_fall_back_to_the_boxed_layout()
+    {
+        const string source = """
+            var a = 1; var b = 20; var c = 300; var d = 4000; var e = 50000;
+            var f = () => a + b + c + d + e;
+            return f();
+            """;
+
+        Assert.Equal(54321, Eval<int>(source));
+    }
+
+    [Fact]
+    public void The_boxed_layout_still_captures_by_reference()
+    {
+        // Five slots, so this runs on the fallback. Writes on either side must be visible on the
+        // other, exactly as they are with a typed layout.
+        const string source = """
+            var a = 1; var b = 2; var c = 3; var d = 4; var e = 5;
+            var bump = () => { a = a + 10; return a + b + c + d + e; };
+            var first = bump();
+            e = 50;
+            var second = bump();
+            return first * 10000 + second * 100 + a;
+            """;
+
+        // first: a becomes 11, 11+2+3+4+5 = 25. second: a becomes 21, 21+2+3+4+50 = 80.
+        Assert.Equal(258021, Eval<int>(source));
+    }
+
+    [Fact]
+    public void A_typed_layout_holds_mixed_value_and_reference_slots()
+    {
+        // int, string, bool and decimal in one closure — four different slot types.
+        const string source = """
+            var count = 2;
+            var label = "xy";
+            var flag = true;
+            var scale = 1.5m;
+            var f = () => label.Length + (flag ? count * scale : 0m);
+            return f();
+            """;
+
+        Assert.Equal(5.0m, Eval<decimal>(source));
+    }
+
+    [Fact]
+    public void A_captured_variable_outlives_the_block_that_declared_it()
+    {
+        const string source = """
+            Func<int> f = () => 0;
+            {
+                var inner = 9;
+                f = () => inner;
+            }
+            return f();
+            """;
+
+        Assert.Equal(9, Eval<int>(source));
+    }
+}

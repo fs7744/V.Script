@@ -11,14 +11,58 @@ namespace V.Script.Emit;
 /// </summary>
 internal sealed partial class IlEmitter
 {
-    private static readonly ConstructorInfo ClosureConstructor =
-        typeof(ScriptClosure).GetConstructor([typeof(ScriptHost), typeof(ScriptClosure), typeof(int)])!;
+    private static readonly ConstructorInfo ArrayClosureConstructor =
+        typeof(ArrayClosure).GetConstructor([typeof(ScriptHost), typeof(ScriptClosure), typeof(int)])!;
 
     private static readonly MethodInfo ClosureParentGetter =
         typeof(ScriptClosure).GetProperty(nameof(ScriptClosure.Parent))!.GetMethod!;
 
     private static readonly MethodInfo ClosureValuesGetter =
-        typeof(ScriptClosure).GetProperty(nameof(ScriptClosure.Values))!.GetMethod!;
+        typeof(ArrayClosure).GetProperty(nameof(ArrayClosure.Values))!.GetMethod!;
+
+    /// <summary>The typed layouts, indexed by how many slots they hold.</summary>
+    private static readonly Type?[] TypedClosureDefinitions =
+    [
+        null,
+        typeof(ScriptClosure<>),
+        typeof(ScriptClosure<,>),
+        typeof(ScriptClosure<,,>),
+        typeof(ScriptClosure<,,,>),
+    ];
+
+    /// <summary>
+    /// The concrete closure class for a scope: a typed layout when the slot types allow one,
+    /// otherwise the boxing fallback.
+    /// </summary>
+    /// <remarks>
+    /// Cached on the scope because emission asks for it once per captured read and write, and
+    /// <see cref="Type.MakeGenericType"/> is not free.
+    /// </remarks>
+    private static Type ClosureTypeFor(ClosureScope scope) => scope.RuntimeType ??= BuildClosureType(scope);
+
+    private static Type BuildClosureType(ClosureScope scope)
+    {
+        var slots = scope.Slots;
+        if (slots.Count is 0 or > ScriptClosure.MaxTypedSlots) return typeof(ArrayClosure);
+
+        var arguments = new Type[slots.Count];
+        for (var i = 0; i < slots.Count; i++)
+        {
+            // Anything that cannot be a generic argument cannot be boxed either, so the fallback
+            // would not work for it either. Nothing in the supported language subset reaches
+            // here; the check is so that a future addition fails the old way rather than a new one.
+            if (!CanBeGenericArgument(slots[i].Type)) return typeof(ArrayClosure);
+            arguments[i] = slots[i].Type;
+        }
+
+        return TypedClosureDefinitions[slots.Count]!.MakeGenericType(arguments);
+    }
+
+    private static bool CanBeGenericArgument(Type type) =>
+        !type.IsByRef && !type.IsByRefLike && !type.IsPointer && type != typeof(void);
+
+    private static FieldInfo SlotField(Type closureType, int slot) =>
+        closureType.GetField($"Slot{slot}")!;
 
     private static readonly MethodInfo GetLambdaMethod =
         typeof(ScriptHost).GetMethod(nameof(ScriptHost.GetLambda))!;
@@ -32,13 +76,27 @@ internal sealed partial class IlEmitter
     /// </summary>
     private void EmitCreateClosure(ClosureScope scope)
     {
-        var local = _il.DeclareLocal(typeof(ScriptClosure));
+        var type = ClosureTypeFor(scope);
+
+        // The local is declared with the concrete type, so every access from this method reaches
+        // its slots without a cast. Only a lambda, which receives the base type as argument 0,
+        // has to prove what it is holding.
+        var local = _il.DeclareLocal(type);
 
         EmitHost();
         EmitParentClosure(scope);
-        EmitLdcI4(scope.Slots.Count);
 
-        _il.Emit(OpCodes.Newobj, ClosureConstructor);
+        if (type == typeof(ArrayClosure))
+        {
+            EmitLdcI4(scope.Slots.Count);
+            _il.Emit(OpCodes.Newobj, ArrayClosureConstructor);
+        }
+        else
+        {
+            _il.Emit(OpCodes.Newobj,
+                type.GetConstructor([typeof(ScriptHost), typeof(ScriptClosure)])!);
+        }
+
         _il.Emit(OpCodes.Stloc, local);
 
         _closures[scope] = local;
@@ -85,26 +143,91 @@ internal sealed partial class IlEmitter
             _il.Emit(OpCodes.Callvirt, ClosureParentGetter);
     }
 
+    /// <summary>
+    /// Pushes the closure holding <paramref name="scope"/>'s slots, statically typed as its
+    /// concrete class so that a field access can follow.
+    /// </summary>
+    private void EmitTypedClosureInstance(ClosureScope scope, Type closureType)
+    {
+        if (_closures.TryGetValue(scope, out var local))
+        {
+            // Declared with the concrete type when it was created, so nothing to prove.
+            _il.Emit(OpCodes.Ldloc, local);
+            return;
+        }
+
+        EmitClosureInstance(scope);
+        _il.Emit(OpCodes.Castclass, closureType);
+    }
+
+    /// <summary>
+    /// Pushes whatever a store into <paramref name="local"/>'s slot needs underneath the value:
+    /// the values array and an index for the boxing fallback, or just the closure for a typed
+    /// layout. Returns whether the layout is typed, which <see cref="EmitSlotStore"/> needs.
+    /// </summary>
+    /// <remarks>
+    /// Split in two because the sites that store into a slot — a declaration, a lambda parameter,
+    /// a catch variable, an assignment — each produce the value differently in between.
+    /// </remarks>
+    private bool EmitSlotStoreTarget(LocalSymbol local)
+    {
+        var scope = local.Closure!;
+        var closureType = ClosureTypeFor(scope);
+
+        if (closureType == typeof(ArrayClosure))
+        {
+            EmitCapturedSlotAddress(local);
+            return false;
+        }
+
+        EmitTypedClosureInstance(scope, closureType);
+        return true;
+    }
+
+    /// <summary>Consumes the value on the stack, completing a store begun with <see cref="EmitSlotStoreTarget"/>.</summary>
+    private void EmitSlotStore(LocalSymbol local, bool typed)
+    {
+        if (typed)
+        {
+            _il.Emit(OpCodes.Stfld, SlotField(ClosureTypeFor(local.Closure!), local.ClosureSlot));
+            return;
+        }
+
+        if (local.Type.IsValueType) _il.Emit(OpCodes.Box, local.Type);
+        _il.Emit(OpCodes.Stelem_Ref);
+    }
+
     /// <summary>Pushes the values array and the slot index, ready for <c>ldelem</c> or <c>stelem</c>.</summary>
     private void EmitCapturedSlotAddress(LocalSymbol local)
     {
         EmitClosureInstance(local.Closure!);
+        _il.Emit(OpCodes.Castclass, typeof(ArrayClosure));
         _il.Emit(OpCodes.Callvirt, ClosureValuesGetter);
         EmitLdcI4(local.ClosureSlot);
     }
 
     private void EmitCapturedLoad(LocalSymbol local)
     {
-        EmitCapturedSlotAddress(local);
-        _il.Emit(OpCodes.Ldelem_Ref);
+        var scope = local.Closure!;
+        var closureType = ClosureTypeFor(scope);
 
-        // unbox.any covers both value types and reference types (where it acts as castclass).
-        _il.Emit(OpCodes.Unbox_Any, local.Type);
+        if (closureType == typeof(ArrayClosure))
+        {
+            EmitCapturedSlotAddress(local);
+            _il.Emit(OpCodes.Ldelem_Ref);
+
+            // unbox.any covers both value types and reference types (where it acts as castclass).
+            _il.Emit(OpCodes.Unbox_Any, local.Type);
+            return;
+        }
+
+        EmitTypedClosureInstance(scope, closureType);
+        _il.Emit(OpCodes.Ldfld, SlotField(closureType, local.ClosureSlot));
     }
 
     private void EmitCapturedStore(LocalSymbol local, BoundExpression value, bool leaveValue)
     {
-        EmitCapturedSlotAddress(local);
+        var typed = EmitSlotStoreTarget(local);
         EmitExpression(value);
 
         LocalBuilder? stash = null;
@@ -115,8 +238,7 @@ internal sealed partial class IlEmitter
             _il.Emit(OpCodes.Stloc, stash);
         }
 
-        if (local.Type.IsValueType) _il.Emit(OpCodes.Box, local.Type);
-        _il.Emit(OpCodes.Stelem_Ref);
+        EmitSlotStore(local, typed);
 
         if (stash is not null) _il.Emit(OpCodes.Ldloc, stash);
     }
