@@ -210,6 +210,15 @@ public sealed class NameOfTests : ScriptTest
     }
 
     [Fact]
+    public void An_overloaded_globals_method()
+    {
+        // Type.GetMethod throws on an ambiguous name, so this has to be answered by listing
+        // the overloads rather than asking for the one method.
+        Assert.Equal("Scale", Run<OverloadedGlobals, string>(
+            "return nameof(Scale);", new OverloadedGlobals()));
+    }
+
+    [Fact]
     public void An_unknown_name_is_an_error() =>
         AssertErrorIn("return nameof(nothingHere);", ErrorCode.UndefinedName);
 }

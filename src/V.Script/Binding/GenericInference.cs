@@ -33,7 +33,7 @@ public static class GenericInference
         LambdaReturnProbe? probe)
     {
         var typeParameters = definition.GetGenericArguments();
-        var parameters = definition.GetParameters();
+        var parameters = MemberCache.ParametersOf(definition);
         var bound = new Dictionary<Type, Type>();
 
         // Round 1: everything that is not a lambda.
@@ -64,7 +64,7 @@ public static class GenericInference
                     var invoke = Conversions.GetInvokeMethod(parameters[parameterIndex].ParameterType);
                     if (invoke is null) continue;
 
-                    var lambdaParameters = invoke.GetParameters();
+                    var lambdaParameters = MemberCache.ParametersOf(invoke);
                     // A method group has no fixed arity of its own; the probe picks the
                     // overload that matches whatever the delegate asks for.
                     if (arguments[i].IsUnboundLambda &&

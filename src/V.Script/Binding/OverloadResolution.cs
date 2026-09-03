@@ -76,11 +76,13 @@ public static class OverloadResolution
 
         // Probing a lambda means binding its body, so the answer is memoised: betterness asks
         // for it once per candidate pair otherwise.
-        var probed = new Dictionary<(int Index, string Signature), Type?>();
+        var probed = new Dictionary<ProbeKey, Type?>();
 
         GenericInference.LambdaReturnProbe? probe = lambdaReturnProbe is null ? null : (index, types) =>
         {
-            var key = (index, string.Join(",", types.Select(t => t.AssemblyQualifiedName)));
+            // Keyed on the type identities themselves. Building an AssemblyQualifiedName per
+            // probe is a surprisingly large share of binding a LINQ chain.
+            var key = new ProbeKey(index, types);
             if (probed.TryGetValue(key, out var cached)) return cached;
 
             var value = lambdaReturnProbe(index, types);
@@ -107,7 +109,7 @@ public static class OverloadResolution
                 candidate = constructed;
             }
 
-            var parameters = candidate.GetParameters();
+            var parameters = MemberCache.ParametersOf(candidate);
 
             if (TryBuild(candidate, parameters, arguments, expanded: false, out var normal, out var normalTypes))
                 applicable.Add((normal! with { FromGenericDefinition = fromGeneric }, normalTypes!));
@@ -149,7 +151,7 @@ public static class OverloadResolution
         IReadOnlyList<ArgumentInfo> arguments,
         GenericInference.LambdaReturnProbe? probe)
     {
-        var parameters = definition.GetParameters();
+        var parameters = MemberCache.ParametersOf(definition);
 
         // A byref parameter whose element type mentions a type parameter would have to be
         // inferred through the reference, which Unify does not do.
@@ -188,6 +190,34 @@ public static class OverloadResolution
         }
 
         return map;
+    }
+
+    /// <summary>Identity of one lambda-return probe: the argument position and the types it was asked about.</summary>
+    /// <remarks>Holds the caller's array rather than copying it; every probe site builds a fresh one.</remarks>
+    private readonly struct ProbeKey(int index, Type[] types) : IEquatable<ProbeKey>
+    {
+        private readonly int _index = index;
+        private readonly Type[] _types = types;
+
+        public bool Equals(ProbeKey other)
+        {
+            if (_index != other._index || _types.Length != other._types.Length) return false;
+
+            for (var i = 0; i < _types.Length; i++)
+                if (_types[i] != other._types[i]) return false;
+
+            return true;
+        }
+
+        public override bool Equals(object? obj) => obj is ProbeKey other && Equals(other);
+
+        public override int GetHashCode()
+        {
+            var hash = new HashCode();
+            hash.Add(_index);
+            foreach (var type in _types) hash.Add(type);
+            return hash.ToHashCode();
+        }
     }
 
     private static bool TryBuild(
@@ -259,8 +289,9 @@ public static class OverloadResolution
             else if (argument.IsUnboundLambda)
             {
                 if (Conversions.GetInvokeMethod(parameterType) is not { } invoke) return false;
-                if (invoke.GetParameters().Length != argument.LambdaArity) return false;
-                if (invoke.GetParameters().Any(p => p.ParameterType.IsByRef)) return false;
+                var invokeParameters = MemberCache.ParametersOf(invoke);
+                if (invokeParameters.Length != argument.LambdaArity) return false;
+                if (invokeParameters.Any(p => p.ParameterType.IsByRef)) return false;
             }
             else if (argument.Type == Conversions.MethodGroupType)
             {
@@ -369,8 +400,8 @@ public static class OverloadResolution
         var rightInvoke = Conversions.GetInvokeMethod(right);
         if (leftInvoke is null || rightInvoke is null) return 0;
 
-        var leftParameters = leftInvoke.GetParameters();
-        var rightParameters = rightInvoke.GetParameters();
+        var leftParameters = MemberCache.ParametersOf(leftInvoke);
+        var rightParameters = MemberCache.ParametersOf(rightInvoke);
         if (leftParameters.Length != rightParameters.Length) return 0;
 
         for (var i = 0; i < leftParameters.Length; i++)

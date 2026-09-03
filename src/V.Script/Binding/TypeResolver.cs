@@ -190,7 +190,7 @@ public sealed class TypeResolver
 
     /// <summary>Whether any extension method by that name could plausibly take this receiver.</summary>
     public bool HasExtensionMethodCandidate(Type receiverType, string name) =>
-        GetExtensionMethods(name).Any(m => CouldReceive(m.GetParameters()[0].ParameterType, receiverType));
+        GetExtensionMethods(name).Any(m => CouldReceive(MemberCache.ParametersOf(m)[0].ParameterType, receiverType));
 
     private static bool CouldReceive(Type parameterType, Type receiverType)
     {

@@ -237,20 +237,28 @@ public static class Conversions
 
     private static Conversion ClassifyUserDefined(Type from, Type to)
     {
-        foreach (var declaring in new[] { from, to })
+        var found = FindConversionOn(from, from, to);
+        if (found.Kind != ConversionKind.None || from == to) return found;
+
+        return FindConversionOn(to, from, to);
+    }
+
+    private static Conversion FindConversionOn(Type declaring, Type from, Type to)
+    {
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.Static;
+
+        foreach (var method in MemberCache.MethodsNamed(declaring, flags, "op_Implicit"))
         {
-            foreach (var method in declaring.GetMethods(BindingFlags.Public | BindingFlags.Static))
-            {
-                if (method.Name is not ("op_Implicit" or "op_Explicit")) continue;
+            var parameters = MemberCache.ParametersOf(method);
+            if (parameters.Length == 1 && parameters[0].ParameterType == from && method.ReturnType == to)
+                return new Conversion(ConversionKind.ImplicitUserDefined, method);
+        }
 
-                var parameters = method.GetParameters();
-                if (parameters.Length != 1) continue;
-                if (parameters[0].ParameterType != from || method.ReturnType != to) continue;
-
-                return method.Name == "op_Implicit"
-                    ? new Conversion(ConversionKind.ImplicitUserDefined, method)
-                    : new Conversion(ConversionKind.ExplicitUserDefined, method);
-            }
+        foreach (var method in MemberCache.MethodsNamed(declaring, flags, "op_Explicit"))
+        {
+            var parameters = MemberCache.ParametersOf(method);
+            if (parameters.Length == 1 && parameters[0].ParameterType == from && method.ReturnType == to)
+                return new Conversion(ConversionKind.ExplicitUserDefined, method);
         }
 
         return Conversion.None;

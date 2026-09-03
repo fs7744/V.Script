@@ -95,7 +95,7 @@ internal sealed partial class Binder
                 $"lambda 只能转换为委托类型，{TypeResolver.Display(delegateType)} 不是委托。");
         }
 
-        var parameters = invoke.GetParameters();
+        var parameters = MemberCache.ParametersOf(invoke);
 
         if (parameters.Length != syntax.Parameters.Count)
         {
@@ -411,14 +411,14 @@ internal sealed partial class Binder
 
         var receiver = MakeLocalAccess(position, _globalsLocal);
 
-        var property = _globals.Type.GetProperty(name, InstanceFlags);
+        var property = MemberCache.Property(_globals.Type, InstanceFlags, name);
         if (property is not null && property.CanRead)
         {
             result = new BoundPropertyAccess(position, receiver, property);
             return true;
         }
 
-        var field = _globals.Type.GetField(name, InstanceFlags);
+        var field = MemberCache.Field(_globals.Type, InstanceFlags, name);
         if (field is not null)
         {
             result = MakeFieldAccess(position, receiver, field);
@@ -487,8 +487,8 @@ internal sealed partial class Binder
         if (_scope.TryLookup(name.Name, out _)) return true;
         if (_globals is null) return false;
 
-        return _globals.Type.GetProperty(name.Name, InstanceFlags) is not null ||
-               _globals.Type.GetField(name.Name, InstanceFlags) is not null;
+        return MemberCache.Property(_globals.Type, InstanceFlags, name.Name) is not null ||
+               MemberCache.Field(_globals.Type, InstanceFlags, name.Name) is not null;
     }
 
     private BoundExpression BindInstanceMember(SourcePosition position, BoundExpression receiver, string name)
@@ -498,7 +498,7 @@ internal sealed partial class Binder
         // A tuple element name is not a real member; it stands for a position.
         if (TupleElementFor(receiver, name, position) is { } element) return element;
 
-        var property = type.GetProperty(name, InstanceFlags);
+        var property = MemberCache.Property(type, InstanceFlags, name);
         if (property is not null)
         {
             if (!property.CanRead)
@@ -506,15 +506,15 @@ internal sealed partial class Binder
             return new BoundPropertyAccess(position, receiver, property);
         }
 
-        var field = type.GetField(name, InstanceFlags);
+        var field = MemberCache.Field(type, InstanceFlags, name);
         if (field is not null) return MakeFieldAccess(position, receiver, field);
 
         // Interfaces do not inherit members through GetProperty/GetField.
         if (type.IsInterface)
         {
-            foreach (var iface in type.GetInterfaces())
+            foreach (var iface in MemberCache.Interfaces(type))
             {
-                var inherited = iface.GetProperty(name, InstanceFlags);
+                var inherited = MemberCache.Property(iface, InstanceFlags, name);
                 if (inherited is not null) return new BoundPropertyAccess(position, receiver, inherited);
             }
         }
@@ -527,11 +527,11 @@ internal sealed partial class Binder
 
     private BoundExpression BindStaticMember(SourcePosition position, Type type, string name)
     {
-        var property = type.GetProperty(name, StaticFlags);
+        var property = MemberCache.Property(type, StaticFlags, name);
         if (property is not null && property.CanRead)
             return new BoundPropertyAccess(position, null, property);
 
-        var field = type.GetField(name, StaticFlags);
+        var field = MemberCache.Field(type, StaticFlags, name);
         if (field is not null) return MakeFieldAccess(position, null, field);
 
         var nested = type.GetNestedType(name, BindingFlags.Public);
@@ -765,11 +765,11 @@ internal sealed partial class Binder
         BoundExpression? receiver,
         SourcePosition position)
     {
-        var property = lookupType.GetProperty(name, receiver is null ? StaticFlags : InstanceFlags);
+        var property = MemberCache.Property(lookupType, receiver is null ? StaticFlags : InstanceFlags, name);
         if (property is not null && property.CanRead && Conversions.IsDelegateType(property.PropertyType))
             return new BoundPropertyAccess(position, receiver, property);
 
-        var field = lookupType.GetField(name, receiver is null ? StaticFlags : InstanceFlags);
+        var field = MemberCache.Field(lookupType, receiver is null ? StaticFlags : InstanceFlags, name);
         if (field is not null && Conversions.IsDelegateType(field.FieldType))
             return new BoundFieldAccess(position, field.IsStatic ? null : receiver, field);
 
@@ -779,7 +779,7 @@ internal sealed partial class Binder
     private BoundExpression BindDelegateInvocation(InvocationExpressionSyntax syntax, BoundExpression target)
     {
         var invoke = Conversions.GetInvokeMethod(target.Type)!;
-        var parameters = invoke.GetParameters();
+        var parameters = MemberCache.ParametersOf(invoke);
 
         if (syntax.Arguments.Count != parameters.Length)
         {
@@ -1023,24 +1023,20 @@ internal sealed partial class Binder
         var flags = staticOnly ? StaticFlags : InstanceFlags | StaticFlags;
         var result = new List<MethodBase>();
 
-        foreach (var method in type.GetMethods(flags))
-            if (method.Name == name && !method.IsSpecialName)
+        foreach (var method in MemberCache.MethodsNamed(type, flags, name))
+            if (!method.IsSpecialName)
                 result.Add(method);
 
         if (type.IsInterface)
         {
-            foreach (var iface in type.GetInterfaces())
-                foreach (var method in iface.GetMethods(InstanceFlags))
-                    if (method.Name == name && !method.IsSpecialName)
+            foreach (var iface in MemberCache.Interfaces(type))
+                foreach (var method in MemberCache.MethodsNamed(iface, InstanceFlags, name))
+                    if (!method.IsSpecialName)
                         result.Add(method);
         }
 
         if (result.Count == 0 && !staticOnly)
-        {
-            foreach (var method in typeof(object).GetMethods(InstanceFlags))
-                if (method.Name == name)
-                    result.Add(method);
-        }
+            result.AddRange(MemberCache.MethodsNamed(typeof(object), InstanceFlags, name));
 
         return RemoveHidden(result);
     }
@@ -1071,8 +1067,8 @@ internal sealed partial class Binder
 
     private static bool SameSignature(MethodBase left, MethodBase right)
     {
-        var a = left.GetParameters();
-        var b = right.GetParameters();
+        var a = MemberCache.ParametersOf(left);
+        var b = MemberCache.ParametersOf(right);
 
         return a.Length == b.Length &&
                left.IsStatic == right.IsStatic &&

@@ -4,6 +4,16 @@ namespace V.Script.Tests;
 
 public sealed class EmptyGlobals;
 
+/// <summary>Globals whose own method is overloaded, which reflection reports ambiguously.</summary>
+public sealed class OverloadedGlobals
+{
+    public int Value { get; init; } = 1;
+
+    public int Scale(int factor) => Value * factor;
+
+    public int Scale(int factor, int offset) => Value * factor + offset;
+}
+
 public sealed class NumberGlobals
 {
     public int A { get; init; }

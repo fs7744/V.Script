@@ -405,9 +405,9 @@ internal sealed partial class Binder
         if (_resolver.Resolve(new TypeSyntax(default, [name], [], false, 0)) is not null) return true;
         if (_globals is null) return false;
 
-        return _globals.Type.GetProperty(name, InstanceFlags) is not null ||
-               _globals.Type.GetField(name, InstanceFlags) is not null ||
-               _globals.Type.GetMethod(name, InstanceFlags) is not null;
+        return MemberCache.Property(_globals.Type, InstanceFlags, name) is not null ||
+               MemberCache.Field(_globals.Type, InstanceFlags, name) is not null ||
+               MemberCache.MethodsNamed(_globals.Type, InstanceFlags, name).Length > 0;
     }
 
     // ============================================================ arrays

@@ -142,7 +142,7 @@ internal sealed partial class Binder
                 $"方法组只能转换为委托类型，{TypeResolver.Display(delegateType)} 不是委托。");
         }
 
-        var wanted = invoke.GetParameters().Select(p => p.ParameterType).ToArray();
+        var wanted = MemberCache.ParametersOf(invoke).Select(p => p.ParameterType).ToArray();
         var match = FindMatchingOverload(group.Methods, wanted, invoke.ReturnType);
 
         if (match is null)
@@ -178,7 +178,7 @@ internal sealed partial class Binder
                 if (candidate is null) continue;
             }
 
-            var parameters = candidate.GetParameters();
+            var parameters = MemberCache.ParametersOf(candidate);
             if (parameters.Length != parameterTypes.Length) continue;
             if (parameters.Where((p, i) => p.ParameterType != parameterTypes[i]).Any()) continue;
 
@@ -199,7 +199,7 @@ internal sealed partial class Binder
     /// <summary>Infers a generic method's type arguments from the delegate's parameter types.</summary>
     private static MethodInfo? TryInferFromSignature(MethodInfo definition, Type[] parameterTypes)
     {
-        if (definition.GetParameters().Length != parameterTypes.Length) return null;
+        if (MemberCache.ParametersOf(definition).Length != parameterTypes.Length) return null;
 
         var infos = parameterTypes.Select(t => new ArgumentInfo(t, null)).ToArray();
         var map = Enumerable.Range(0, parameterTypes.Length).ToArray();

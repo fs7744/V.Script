@@ -215,7 +215,7 @@ internal sealed partial class Binder
             var userDefined = FindUnaryOperator(kind, operandBase);
             if (userDefined is not null)
             {
-                var parameterType = userDefined.GetParameters()[0].ParameterType;
+                var parameterType = MemberCache.ParametersOf(userDefined)[0].ParameterType;
                 var argument = Convert(operand, lifted ? Conversions.Lift(parameterType) : parameterType,
                     position, explicitCast: false);
                 var resultType = lifted ? Conversions.Lift(userDefined.ReturnType) : userDefined.ReturnType;
@@ -260,10 +260,9 @@ internal sealed partial class Binder
         };
         if (name is null) return null;
 
-        foreach (var method in operand.GetMethods(BindingFlags.Public | BindingFlags.Static))
+        foreach (var method in MemberCache.MethodsNamed(operand, StaticFlags, name))
         {
-            if (method.Name != name) continue;
-            var parameters = method.GetParameters();
+            var parameters = MemberCache.ParametersOf(method);
             if (parameters.Length == 1 && Conversions.HasImplicit(operand, parameters[0].ParameterType))
                 return method;
         }
@@ -396,7 +395,7 @@ internal sealed partial class Binder
         var userDefined = FindBinaryOperator(kind, leftBase, rightBase);
         if (userDefined is not null)
         {
-            var parameters = userDefined.GetParameters();
+            var parameters = MemberCache.ParametersOf(userDefined);
             var leftType = lifted ? Conversions.Lift(parameters[0].ParameterType) : parameters[0].ParameterType;
             var rightType = lifted ? Conversions.Lift(parameters[1].ParameterType) : parameters[1].ParameterType;
             var resultType = lifted ? Conversions.Lift(userDefined.ReturnType) : userDefined.ReturnType;
@@ -593,7 +592,7 @@ internal sealed partial class Binder
         var userDefined = FindBinaryOperator(kind, leftBase, rightBase);
         if (userDefined is not null)
         {
-            var parameters = userDefined.GetParameters();
+            var parameters = MemberCache.ParametersOf(userDefined);
             return new BoundBinary(position, typeof(bool), kind,
                 Convert(left, lifted ? Conversions.Lift(parameters[0].ParameterType) : parameters[0].ParameterType,
                     position, explicitCast: false),
@@ -677,17 +676,21 @@ internal sealed partial class Binder
         };
         if (name is null) return null;
 
-        foreach (var declaring in left == right ? [left] : new[] { left, right })
+        var found = FindBinaryOperatorOn(left, name, left, right);
+        if (found is not null || left == right) return found;
+
+        return FindBinaryOperatorOn(right, name, left, right);
+    }
+
+    private static MethodInfo? FindBinaryOperatorOn(Type declaring, string name, Type left, Type right)
+    {
+        foreach (var method in MemberCache.MethodsNamed(declaring, StaticFlags, name))
         {
-            foreach (var method in declaring.GetMethods(BindingFlags.Public | BindingFlags.Static))
-            {
-                if (method.Name != name) continue;
-                var parameters = method.GetParameters();
-                if (parameters.Length != 2) continue;
-                if (!Conversions.HasImplicit(left, parameters[0].ParameterType)) continue;
-                if (!Conversions.HasImplicit(right, parameters[1].ParameterType)) continue;
-                return method;
-            }
+            var parameters = MemberCache.ParametersOf(method);
+            if (parameters.Length != 2) continue;
+            if (!Conversions.HasImplicit(left, parameters[0].ParameterType)) continue;
+            if (!Conversions.HasImplicit(right, parameters[1].ParameterType)) continue;
+            return method;
         }
 
         return null;
