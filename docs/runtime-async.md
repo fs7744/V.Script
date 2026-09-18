@@ -238,7 +238,7 @@ OK  catch 内真正挂起的 await 会终止进程（预期如此）
 
 ### 4. 预览版依赖
 
-- `AsyncHelpers` 带 `SYSLIB5007` 实验性标记，签名可能变。V.Script 把使用点全部收拢在 [`Binding/AwaitHelpers.cs`](https://github.com/fs7744/V.Script/blob/main/src/V.Script/Binding/AwaitHelpers.cs) 一个文件里，就是为了将来好改。
+- `AsyncHelpers` 带 `SYSLIB5007` 实验性标记，签名可能变。V.Script 把使用点全部收拢在 [`V.Script.Async/AsyncSupport.cs`](https://github.com/fs7744/V.Script/blob/main/src/V.Script.Async/AsyncSupport.cs) 一个文件里，就是为了将来好改——基础库 `V.Script` 完全不引用它。
 - [`global.json`](https://github.com/fs7744/V.Script/blob/main/global.json) 精确 pin 了预览版号（`rollForward` 没法从正式版号回退到预览版），GA 后需要改。
 - **GA 后请重跑 [`tools/V.Script.RuntimeAsyncCheck`](https://github.com/fs7744/V.Script/tree/main/tools/V.Script.RuntimeAsyncCheck)**，整个异步设计都建立在它那 9 条结论上。
 

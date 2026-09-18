@@ -135,13 +135,23 @@ internal sealed partial class Binder
         _protectedDepth = 0;
         _labels = [];
         _pendingGotos = [];
+        // An async lambda needs a method carrying the Async implementation flag, which only
+        // the extension can provide; without it the context stays synchronous so that `await`
+        // inside the body reports too rather than dereferencing a missing implementation.
+        if (syntax.IsAsync && _async is null)
+        {
+            return Fail(syntax.Position, ErrorCode.AsyncNotAvailable,
+                "async lambda 需要 V.Script.Async 扩展；" +
+                "请引用它并改用 ScriptOptions.WithAsync()。");
+        }
+
         _isAsyncContext = syntax.IsAsync;
 
         // An async lambda's body produces the awaited value; the Task around it is the runtime's
         // doing, exactly as for an async script body.
         var declaredReturnType = invoke.ReturnType;
         var bodyReturnType = syntax.IsAsync
-            ? AwaitHelpers.UnwrapTaskType(declaredReturnType)
+            ? _async!.UnwrapAsyncReturnType(declaredReturnType)
             : declaredReturnType;
 
         if (bodyReturnType is null)
@@ -467,7 +477,7 @@ internal sealed partial class Binder
 
                 case NameExpressionSyntax name:
                     parts.Push(name.Name);
-                    dotted = string.Join('.', parts);
+                    dotted = string.Join(".", parts);
                     return true;
 
                 default:
@@ -855,6 +865,9 @@ internal sealed partial class Binder
 
         if (syntax.IsAsync)
         {
+            // The natural delegate type of an async lambda is the one returning the task, even
+            // when the extension is absent — what is missing then is the ability to compile it,
+            // not the ability to name its type.
             returnType = returnType == typeof(void)
                 ? typeof(Task)
                 : typeof(Task<>).MakeGenericType(returnType);
@@ -923,7 +936,10 @@ internal sealed partial class Binder
         _protectedDepth = 0;
         _labels = [];
         _pendingGotos = [];
-        _isAsyncContext = syntax.IsAsync;
+
+        // Speculative bind: its diagnostics are thrown away, so the guard that reports a missing
+        // async extension lives in the real bind. Here it only has to not pretend it can suspend.
+        _isAsyncContext = syntax.IsAsync && _async is not null;
 
         try
         {
@@ -1314,16 +1330,15 @@ internal sealed partial class Binder
                 "该组合会导致进程崩溃。请将异步调用移出处理器。");
         }
 
-        var awaited = AwaitHelpers.Describe(operand.Type);
+        var awaited = _async!.DescribeAwaitable(operand.Type);
         if (awaited is null)
         {
             return Fail(syntax.Position, ErrorCode.NotAWaitable,
                 $"无法 await 类型 {TypeResolver.Display(operand.Type)}；仅支持 Task、Task<T>、ValueTask、ValueTask<T>。");
         }
 
-        var (kind, resultType) = awaited.Value;
-        var helper = AwaitHelpers.GetAwaitMethod(kind, resultType);
-
-        return new BoundAwait(syntax.Position, resultType, operand, kind, helper);
+        // Suspension is an ordinary static call: the method takes the awaitable and returns the
+        // result, and the JIT builds the state machine around it. The emitter knows nothing.
+        return new BoundCall(syntax.Position, null, awaited.Value.Suspend, [operand]);
     }
 }

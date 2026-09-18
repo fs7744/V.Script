@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>V.Script.Async.Tests</AssemblyName>
+    <RootNamespace>V.Script.Async.Tests</RootNamespace>
+    <NoWarn>$(NoWarn);CS1591;xUnit1051</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\V.Script.Async\V.Script.Async.csproj" />
+    <!-- For the shared globals types and helpers; the base library's own tests live there and
+         are discovered in their own assembly, not this one. -->
+    <ProjectReference Include="..\V.Script.Tests\V.Script.Tests.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+</Project>

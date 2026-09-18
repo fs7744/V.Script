@@ -1,4 +1,3 @@
-using System.Buffers;
 using System.Collections.Frozen;
 using System.Globalization;
 using System.Text;
@@ -53,8 +52,6 @@ public sealed class Lexer
             ["with"] = SyntaxKind.WithKeyword,
         }.ToFrozenDictionary(StringComparer.Ordinal);
 
-    private static readonly SearchValues<char> DigitChars =
-        SearchValues.Create("0123456789");
 
     private readonly string _text;
     private readonly DiagnosticBag _diagnostics;
@@ -125,7 +122,7 @@ public sealed class Lexer
         if (char.IsLetter(c) || c == '_' || c == '@')
             return ReadIdentifierOrKeyword(start);
 
-        if (char.IsAsciiDigit(c) || (c == '.' && char.IsAsciiDigit(Peek())))
+        if (IsDigit(c) || (c == '.' && IsDigit(Peek())))
             return ReadNumber(start);
 
         if (c == '$' && StartsRawInterpolation()) return ReadRawInterpolatedString(start);
@@ -224,7 +221,7 @@ public sealed class Lexer
         ScanDigits();
 
         var isReal = false;
-        if (Current == '.' && char.IsAsciiDigit(Peek()))
+        if (Current == '.' && IsDigit(Peek()))
         {
             isReal = true;
             _pos++;
@@ -236,7 +233,7 @@ public sealed class Lexer
             var save = _pos;
             _pos++;
             if (Current is '+' or '-') _pos++;
-            if (char.IsAsciiDigit(Current)) { isReal = true; ScanDigits(); }
+            if (IsDigit(Current)) { isReal = true; ScanDigits(); }
             else _pos = save;
         }
 
@@ -247,10 +244,13 @@ public sealed class Lexer
         return DecodeNumber(digits, suffix, isReal, raw, start);
     }
 
+    /// <summary>A single ASCII range, so a comparison beats any lookup structure.</summary>
+    private static bool IsDigit(char c) => (uint)(c - '0') <= 9;
+
     private void ScanDigits()
     {
         while (_pos < _text.Length &&
-               (DigitChars.Contains(Current) || (Current == '_' && DigitChars.Contains(Peek()))))
+               (IsDigit(Current) || (Current == '_' && IsDigit(Peek()))))
             _pos++;
     }
 
@@ -310,9 +310,9 @@ public sealed class Lexer
 
     private static Token MakeSigned(string digits, string raw, SourcePosition start)
     {
-        if (int.TryParse(digits, CultureInfo.InvariantCulture, out var i))
+        if (int.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i))
             return new Token(SyntaxKind.IntLiteral, raw, start, i);
-        if (long.TryParse(digits, CultureInfo.InvariantCulture, out var l))
+        if (long.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out var l))
             return new Token(SyntaxKind.LongLiteral, raw, start, l);
         return new Token(SyntaxKind.ULongLiteral, raw, start,
             ulong.Parse(digits, CultureInfo.InvariantCulture));
@@ -320,7 +320,7 @@ public sealed class Lexer
 
     private static Token MakeUnsigned(string digits, string raw, SourcePosition start, bool forceLong)
     {
-        if (!forceLong && uint.TryParse(digits, CultureInfo.InvariantCulture, out var u))
+        if (!forceLong && uint.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out var u))
             return new Token(SyntaxKind.UIntLiteral, raw, start, u);
         return new Token(SyntaxKind.ULongLiteral, raw, start,
             ulong.Parse(digits, CultureInfo.InvariantCulture));
@@ -588,7 +588,10 @@ public sealed class Lexer
         }
 
         var indent = closing.Length;
-        var body = lines[1..^1];
+        // Not lines[1..^1]: that lowers to RuntimeHelpers.GetSubArray, which netstandard2.0
+        // has no way to provide.
+        var body = new string[lines.Length - 2];
+        Array.Copy(lines, 1, body, 0, body.Length);
 
         for (var i = 0; i < body.Length; i++)
         {
@@ -604,7 +607,7 @@ public sealed class Lexer
             body[i] = body[i][indent..];
         }
 
-        return string.Join('\n', body);
+        return string.Join("\n", body);
     }
 
     private Token ReadString(SourcePosition start)

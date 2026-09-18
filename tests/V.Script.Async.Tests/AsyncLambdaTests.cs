@@ -1,12 +1,14 @@
 using V.Script.Diagnostics;
 
-namespace V.Script.Tests;
+using V.Script.Tests;
+
+namespace V.Script.Async.Tests;
 
 /// <summary>
 /// <c>async</c> lambdas and local functions. They need the same runtime-async flag the script
 /// body does, so a synchronous script containing one still gets a generated assembly for it.
 /// </summary>
-public sealed class AsyncLambdaTests : ScriptTest
+public sealed class AsyncLambdaTests : AsyncScriptTest
 {
     [Fact]
     public async Task An_async_lambda_inside_an_async_script()

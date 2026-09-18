@@ -318,15 +318,6 @@ public sealed class LambdaDiagnosticTests : ScriptTest
     }
 
     [Fact]
-    public void Await_inside_a_lambda_is_rejected()
-    {
-        AssertError<AsyncGlobals, int>(
-            "Func<int> f = () => await Service.GetAsync(1); return f();",
-            ErrorCode.AwaitInLambda,
-            async: true);
-    }
-
-    [Fact]
     public void Delegate_invoked_with_the_wrong_argument_count()
     {
         AssertError<LambdaGlobals, int>(

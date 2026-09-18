@@ -44,66 +44,12 @@ public sealed class Script<TGlobals, TResult> : ICompiledScript
     /// <summary>Runs the script. This is a direct delegate call — nothing is wrapped around it.</summary>
     public TResult Run(TGlobals globals)
     {
-        ObjectDisposedException.ThrowIf(_disposed != 0, this);
+        Guard.NotDisposed(_disposed != 0, this);
         return _invoke(globals);
     }
 
     /// <summary>The compiled delegate itself, for callers that want to skip even the disposed check.</summary>
     public Func<TGlobals, TResult> Delegate => _invoke;
-
-    public void Dispose()
-    {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        _onDispose?.Invoke();
-        _owner?.Dispose();
-    }
-}
-
-/// <summary>
-/// A compiled asynchronous script. Its code lives in a dedicated collectible assembly, so
-/// disposing this instance releases that one script's memory without affecting the others.
-/// </summary>
-/// <remarks>
-/// <see cref="RunAsync"/> hands back the generated method's own <see cref="Task{TResult}"/>
-/// unchanged. There is no wrapper state machine and no per-invocation timer, which is what keeps
-/// an asynchronous call as cheap as a synchronous one. Cancellation belongs to the host: put a
-/// <see cref="CancellationToken"/> on the globals object and let the script pass it to whatever
-/// it awaits.
-/// </remarks>
-public sealed class AsyncScript<TGlobals, TResult> : ICompiledScript
-{
-    private readonly Func<TGlobals, Task<TResult>> _invoke;
-    private readonly IDisposable? _owner;
-    private readonly Action? _onDispose;
-    private int _disposed;
-
-    internal AsyncScript(
-        string source,
-        Func<TGlobals, Task<TResult>> invoke,
-        IDisposable? owner,
-        IReadOnlyList<Diagnostic> diagnostics,
-        Action? onDispose)
-    {
-        Source = source;
-        _invoke = invoke;
-        _owner = owner;
-        Diagnostics = diagnostics;
-        _onDispose = onDispose;
-    }
-
-    public string Source { get; }
-
-    public IReadOnlyList<Diagnostic> Diagnostics { get; }
-
-    /// <summary>Runs the script and returns its task directly.</summary>
-    public Task<TResult> RunAsync(TGlobals globals)
-    {
-        ObjectDisposedException.ThrowIf(_disposed != 0, this);
-        return _invoke(globals);
-    }
-
-    /// <summary>The compiled delegate itself, for callers that want to skip even the disposed check.</summary>
-    public Func<TGlobals, Task<TResult>> Delegate => _invoke;
 
     public void Dispose()
     {

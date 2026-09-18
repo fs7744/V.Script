@@ -1,8 +1,18 @@
 # V.Script
 
-A lightweight script execution engine for .NET 11. Scripts are a subset of C# statements, they
+A lightweight script execution engine for .NET. Scripts are a subset of C# statements, they
 bind against the real CLR type system, and they compile straight to IL — no Roslyn, no
 interpreter. Lambdas, closures, LINQ and pattern matching work, and so does `async`/`await`.
+
+It ships as two packages:
+
+| | Targets | What it is |
+|---|---|---|
+| **`V.Script`** | netstandard2.0, net6.0 – net10.0 | The engine. Everything except suspension. |
+| **`V.Script.Async`** | net11.0 | Adds `await`. Needs .NET 11's runtime async. |
+
+Reach for the base package alone unless your scripts suspend — it has no preview dependencies
+and no generated assemblies at all.
 
 ```csharp
 using var engine = new ScriptEngine();
@@ -18,17 +28,67 @@ decimal total = pricing.Run(context);
 
 ## Requirements
 
-.NET 11 SDK. The engine depends on **runtime async**, which is a .NET 11 runtime feature: the
-JIT builds the state machine from a method marked `MethodImplOptions.Async`, so the compiler
-only has to emit straight-line IL with a call to `AsyncHelpers.Await`. There is no fallback for
-earlier runtimes, and NativeAOT is not supported (the async carrier needs `Reflection.Emit`).
+**`V.Script`** ships assets for netstandard2.0, net6.0, net7.0, net8.0, net9.0 and net10.0; a
+.NET 11 consumer resolves to the net10.0 one, so nothing in it is built against a preview
+reference assembly. It compiles into `DynamicMethod`, so it needs `Reflection.Emit` — which is
+why no AOT target (NativeAOT, IL2CPP) can host it, whatever the asset says. From net8.0 it has no
+package dependencies at all; net6.0 and net7.0 add `System.Collections.Immutable` for the frozen
+collections, and netstandard2.0 adds that plus `System.Memory` and the three `System.Reflection.Emit`
+packages.
 
-`AsyncHelpers` is still marked `[Experimental("SYSLIB5007")]`; the project suppresses that
-warning in one place, and all use of it is confined to `Binding/AwaitHelpers.cs`.
+### What netstandard2.0 does not have
+
+Two constructs, reported as compile errors rather than failing at run time:
+
+| Construct | Why |
+|---|---|
+| `^i` — index from the end | `System.Index` is not in the framework. This library carries a shim for its own use, but it is `internal`; emitting it into a script would hand you a type you cannot name. |
+| `a..b` — range and slicing | Same, plus `array[a..b]` needs `RuntimeHelpers.GetSubArray`, which exists there as a type *without* that method and so cannot be shimmed from outside. |
+
+And one behavioural difference: a `switch` expression that matches nothing throws
+`InvalidOperationException` instead of `SwitchExpressionException`, which that framework does not
+define. Everything else — lambdas, closures, LINQ, patterns, tuples, interpolation, raw strings —
+behaves identically; interpolation with a format specifier lowers to `string.Format` rather than
+`DefaultInterpolatedStringHandler`, which costs about 25% on that one construct.
+
+`tools/V.Script.NetStandardCheck` pins the netstandard2.0 asset and exercises all of this.
+
+**`V.Script.Async`** needs .NET 11. It depends on **runtime async**, a .NET 11 runtime feature:
+the JIT builds the state machine from a method marked `MethodImplOptions.Async`, so the compiler
+only has to emit straight-line IL with a call to `AsyncHelpers.Await`. There is no fallback for
+earlier runtimes.
+
+`AsyncHelpers` is still marked `[Experimental("SYSLIB5007")]`. All use of it is confined to one
+file in that package — the base package never touches it.
 
 `global.json` pins the exact preview SDK, because `rollForward` cannot move from a release
 version number onto a prerelease of the same version. Bump that pin — or delete the file — once
 .NET 11 reaches GA.
+
+## Which package
+
+`await` is part of the grammar either way: the base package parses it, and reports `VS3001` if
+you compile a script that uses it. What it cannot do is generate a method that suspends, because
+that method must carry `MethodImplAttributes.Async` and a `DynamicMethod` has no way to carry it.
+
+Adding `V.Script.Async` makes `CompileAsync` available — as extension methods in the same
+`V.Script` namespace, so existing calls keep compiling:
+
+```csharp
+using var engine = new ScriptEngine();
+using var script = engine.CompileAsync<FetchContext, decimal>("await Orders.TotalAsync(Id)");
+```
+
+One case needs an explicit opt-in: an `async` lambda inside an otherwise *synchronous* script.
+The base package decides at bind time whether it can compile one, so the options have to say so:
+
+```csharp
+var engine = new ScriptEngine(ScriptOptions.Default.WithAsync());
+using var s = engine.Compile<Ctx, int>("Func<Task<int>> f = async () => await F(); return f().Result;");
+```
+
+`WithAsync` also takes how many scripts should share a generated assembly — see
+[`docs/design.md`](docs/design.md) §4 for what that trades away.
 
 ## Two carriers, one emitter
 
@@ -135,7 +195,8 @@ short-circuiting logic — so the emitter has no pattern-specific code at all.
 ### Asynchronous scripts
 
 `Compile` and `CompileAsync` are separate on purpose: a synchronous compile that meets `await`
-fails with `VS3001` rather than silently handing back something that must be awaited.
+fails with `VS3001` rather than silently handing back something that must be awaited. This is
+also the package boundary — `CompileAsync` comes from `V.Script.Async`.
 
 ```csharp
 using var script = engine.CompileAsync<FetchContext, decimal>("""

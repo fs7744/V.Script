@@ -282,15 +282,5 @@ public sealed class LocalFunctionTests : ScriptTest
     public void A_local_function_outside_a_block_is_rejected() =>
         AssertErrorIn("if (true) int F() => 1; return 0;", ErrorCode.ConstructNotSupported);
 
-    [Fact]
-    public async Task A_local_function_works_in_an_async_script()
-    {
-        const string source = """
-            int Twice(int n) => n * 2;
-            var value = await Service.CompletedAsync(3);
-            return Twice(value);
-            """;
 
-        Assert.Equal(8, await RunAsync<AsyncGlobals, int>(source, new AsyncGlobals()));
-    }
 }

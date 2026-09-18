@@ -280,14 +280,5 @@ public sealed class ThrowExpressionTests : ScriptTest
     public void Throwing_a_non_exception_is_an_error() =>
         AssertErrorIn("string s = null; return s ?? throw \"oops\";", ErrorCode.CannotConvert);
 
-    [Fact]
-    public async Task Throw_expression_in_an_async_script()
-    {
-        const string source = """
-            var value = await Service.CompletedAsync(1);
-            return value > 0 ? value : throw new InvalidOperationException("neg");
-            """;
 
-        Assert.Equal(2, await RunAsync<AsyncGlobals, int>(source, new AsyncGlobals()));
-    }
 }

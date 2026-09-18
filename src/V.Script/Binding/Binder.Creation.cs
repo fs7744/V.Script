@@ -606,7 +606,7 @@ internal sealed partial class Binder
 
     /// <summary>
     /// Lowers an interpolation that has alignment or format specifiers the way the C# compiler
-    /// does: into a <see cref="DefaultInterpolatedStringHandler"/> built up call by call.
+    /// does: into a <c>DefaultInterpolatedStringHandler</c> built up call by call.
     /// </summary>
     /// <remarks>
     /// The alternative, <c>string.Format</c>, has to parse the composite format string at run
@@ -618,6 +618,8 @@ internal sealed partial class Binder
     /// back to <c>string.Format</c>.
     /// </para>
     /// </remarks>
+#if !NETSTANDARD2_0
+
     private BoundExpression? BindInterpolationAsHandler(SourcePosition position, List<InterpolationPart> parts)
     {
         var handlerType = typeof(DefaultInterpolatedStringHandler);
@@ -716,7 +718,15 @@ internal sealed partial class Binder
 
     /// <summary>Whether a type can stand in for a generic parameter at all.</summary>
     private static bool CanBeGenericArgument(Type type) =>
-        !type.IsByRef && !type.IsByRefLike && !type.IsPointer && type != typeof(void);
+        !type.IsByRef && !type.IsByRefLike() && !type.IsPointer && type != typeof(void);
+
+#else
+
+    private BoundExpression? BindInterpolationAsHandler(SourcePosition position, List<InterpolationPart> parts) =>
+        // netstandard2.0 has no DefaultInterpolatedStringHandler; string.Format it is.
+        null;
+
+#endif
 
     private BoundExpression BindInterpolationAsFormat(SourcePosition position, List<InterpolationPart> parts)
     {

@@ -113,7 +113,7 @@ internal sealed partial class Binder
 
         // `ItemN` past the seventh is not a real field, but C# still accepts it and walks Rest.
         if (name.StartsWith("Item", StringComparison.Ordinal) &&
-            int.TryParse(name.AsSpan(4), out var ordinal) &&
+            int.TryParse(name.Substring(4), out var ordinal) &&
             ordinal > TupleChunk && ordinal <= arity)
         {
             return TupleElementAccess(receiver, ordinal - 1, position);

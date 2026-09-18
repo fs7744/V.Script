@@ -1,7 +1,7 @@
 using System.Reflection;
 using System.Reflection.Emit;
 
-namespace V.Script.Emit;
+namespace V.Script.Async;
 
 /// <summary>
 /// Hands out types for generated code to live in, grouped into collectible assemblies.
@@ -15,7 +15,7 @@ namespace V.Script.Emit;
 /// reclaimed the moment that script is disposed. A shared assembly can only unload once every
 /// script in it is gone, so a single long-lived script pins its whole generation. That is why
 /// the default is one script per assembly — the documented behaviour — and a host that compiles
-/// scripts in batches opts in with <see cref="ScriptOptions.ScriptsPerGeneratedAssembly"/>.
+/// scripts in batches opts in with <c>ScriptOptions.WithAsync()</c>.
 /// </para>
 /// </remarks>
 internal sealed class GeneratedAssemblyPool(int scriptsPerAssembly)
@@ -124,7 +124,7 @@ internal sealed class GeneratedAssemblyPool(int scriptsPerAssembly)
     /// disposing it is what lets the assembly go once every sibling has been disposed too.
     /// </summary>
     public sealed class TypeLease(GeneratedAssemblyPool.Generation generation, TypeBuilder builder, string name)
-        : IDisposable
+        : IGeneratedType
     {
         private Generation? _generation = generation;
         private Type? _created;

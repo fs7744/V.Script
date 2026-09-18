@@ -1,6 +1,9 @@
 <Project>
   <PropertyGroup>
-    <TargetFramework>net11.0</TargetFramework>
+    <!-- The default. A project that multi-targets clears this and sets TargetFrameworks; the
+         condition also lets -p:TargetFramework=... on the command line pick a single one, which
+         is how the base library gets test-run against an older runtime. -->
+    <TargetFramework Condition="'$(TargetFramework)' == ''">net11.0</TargetFramework>
     <LangVersion>preview</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>

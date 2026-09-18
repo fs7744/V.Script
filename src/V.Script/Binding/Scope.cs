@@ -10,7 +10,12 @@ internal sealed class Scope(Scope? parent)
 
     public Scope? Parent { get; } = parent;
 
-    public bool TryDeclare(LocalSymbol symbol) => _locals.TryAdd(symbol.Name, symbol);
+    public bool TryDeclare(LocalSymbol symbol)
+    {
+        if (_locals.ContainsKey(symbol.Name)) return false;
+        _locals[symbol.Name] = symbol;
+        return true;
+    }
 
     public bool TryLookup(string name, out LocalSymbol symbol)
     {

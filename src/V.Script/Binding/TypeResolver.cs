@@ -52,7 +52,7 @@ public sealed class TypeResolver
     public Type? Resolve(TypeSyntax syntax)
     {
         var arity = syntax.TypeArguments.Count;
-        var name = string.Join('.', syntax.NameParts);
+        var name = string.Join(".", syntax.NameParts);
 
         Type? type;
         if (arity == 0)
@@ -146,7 +146,7 @@ public sealed class TypeResolver
     /// </summary>
     private FrozenDictionary<string, MethodInfo[]> BuildExtensionIndex()
     {
-        var imports = _imports.ToHashSet(StringComparer.Ordinal);
+        var imports = new HashSet<string>(_imports, StringComparer.Ordinal);
         var byName = new Dictionary<string, List<MethodInfo>>(StringComparer.Ordinal);
 
         foreach (var assembly in _references)
@@ -215,8 +215,8 @@ public sealed class TypeResolver
     {
         if (type == Conversions.NullLiteralType) return "null";
 
-        foreach (var (alias, aliased) in Aliases)
-            if (aliased == type) return alias;
+        foreach (var entry in Aliases)
+            if (entry.Value == type) return entry.Key;
 
         if (Conversions.IsNullableValueType(type))
             return Display(Nullable.GetUnderlyingType(type)!) + "?";

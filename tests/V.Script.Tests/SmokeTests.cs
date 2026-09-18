@@ -42,26 +42,5 @@ public sealed class SmokeTests : ScriptTest
         Assert.Equal(13, f(3, 4));
     }
 
-    [Fact]
-    public async Task Async_script_awaits_and_returns()
-    {
-        var globals = new AsyncGlobals { Seed = 21 };
-        var result = await RunAsync<AsyncGlobals, int>("await Service.GetAsync(Seed)", globals);
-        Assert.Equal(42, result);
-    }
 
-    [Fact]
-    public async Task Await_inside_a_loop_runs_the_state_machine()
-    {
-        var globals = new AsyncGlobals { Ids = [1, 2, 3] };
-
-        const string source = """
-            var sum = 0;
-            foreach (var id in Ids)
-                sum += await Service.GetAsync(id);
-            return sum;
-            """;
-
-        Assert.Equal(12, await RunAsync<AsyncGlobals, int>(source, globals));
-    }
 }

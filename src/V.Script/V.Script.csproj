@@ -1,12 +1,42 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
+    <!-- The base library is pure DynamicMethod + IL: it needs no runtime-async, so it targets
+         released frameworks only. V.Script.Async is the one that requires .NET 11, and a .NET 11
+         consumer resolves to the net10.0 asset here — nothing in this library is built against a
+         preview reference assembly.
+
+         net6.0 is the floor. Below it lies netstandard2.0, which additionally needs polyfills for
+         Index/Range, a Reflection.Emit package whose netstandard support is legacy, and a
+         different shape for the params parameters — see docs/design.md §14. -->
+    <!-- Clears the single-target default from Directory.Build.props, evaluated before this. -->
+    <TargetFramework />
+    <TargetFrameworks>netstandard2.0;net6.0;net7.0;net8.0;net9.0;net10.0</TargetFrameworks>
     <RootNamespace>V.Script</RootNamespace>
     <AssemblyName>V.Script</AssemblyName>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CS1591</NoWarn>
   </PropertyGroup>
+
+  <!-- Frozen collections ship in the shared framework from .NET 8; on the two older targets they
+       come from the package that also carries System.Collections.Immutable. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net6.0' or '$(TargetFramework)' == 'net7.0'">
+    <PackageReference Include="System.Collections.Immutable" Version="8.0.0" />
+  </ItemGroup>
+
+  <!-- netstandard2.0 has none of this in the box: immutable and frozen collections, spans, and
+       Reflection.Emit itself. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
+    <PackageReference Include="System.Collections.Immutable" Version="8.0.0" />
+    <PackageReference Include="System.Memory" Version="4.6.0" />
+    <PackageReference Include="System.Reflection.Emit" Version="4.7.0" />
+    <PackageReference Include="System.Reflection.Emit.ILGeneration" Version="4.7.0" />
+    <PackageReference Include="System.Reflection.Emit.Lightweight" Version="4.7.0" />
+  </ItemGroup>
+
   <ItemGroup>
+    <InternalsVisibleTo Include="V.Script.Async" />
     <InternalsVisibleTo Include="V.Script.Tests" />
+    <InternalsVisibleTo Include="V.Script.Async.Tests" />
     <InternalsVisibleTo Include="V.Script.Benchmarks" />
   </ItemGroup>
 </Project>

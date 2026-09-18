@@ -1,15 +1,18 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/V.Script/V.Script.csproj" />
+    <Project Path="src/V.Script.Async/V.Script.Async.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/V.Script.Tests/V.Script.Tests.csproj" />
+    <Project Path="tests/V.Script.Async.Tests/V.Script.Async.Tests.csproj" />
   </Folder>
   <Folder Name="/bench/">
     <Project Path="bench/V.Script.Benchmarks/V.Script.Benchmarks.csproj" />
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/V.Script.Probe/V.Script.Probe.csproj" />
+    <Project Path="tools/V.Script.NetStandardCheck/V.Script.NetStandardCheck.csproj" />
     <Project Path="tools/V.Script.RuntimeAsyncCheck/V.Script.RuntimeAsyncCheck.csproj" />
   </Folder>
 </Solution>
