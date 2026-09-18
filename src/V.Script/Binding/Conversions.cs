@@ -138,8 +138,8 @@ public static class Conversions
     /// </summary>
     public static Conversion Classify(Type from, Type to)
     {
-        ArgumentNullException.ThrowIfNull(from);
-        ArgumentNullException.ThrowIfNull(to);
+        Guard.NotNull(from, nameof(from));
+        Guard.NotNull(to, nameof(to));
 
         if (from == to) return Conversion.Identity;
 

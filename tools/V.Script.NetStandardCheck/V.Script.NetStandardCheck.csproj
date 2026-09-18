@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>V.Script.NetStandardCheck</AssemblyName>
+    <RootNamespace>V.Script.NetStandardCheck</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- SetTargetFramework pins which asset is consumed, so this really exercises the
+         netstandard2.0 build rather than whichever one NuGet would pick. -->
+    <ProjectReference Include="..\..\src\V.Script\V.Script.csproj"
+                      SetTargetFramework="TargetFramework=netstandard2.0" />
+  </ItemGroup>
+</Project>

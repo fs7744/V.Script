@@ -59,7 +59,7 @@ internal sealed partial class IlEmitter
     }
 
     private static bool CanBeGenericArgument(Type type) =>
-        !type.IsByRef && !type.IsByRefLike && !type.IsPointer && type != typeof(void);
+        !type.IsByRef && !type.IsByRefLike() && !type.IsPointer && type != typeof(void);
 
     private static FieldInfo SlotField(Type closureType, int slot) =>
         closureType.GetField($"Slot{slot}")!;

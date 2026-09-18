@@ -17,6 +17,8 @@ namespace V.Script.Binding;
 /// </remarks>
 internal sealed partial class Binder
 {
+#if !NETSTANDARD2_0
+
     private static readonly ConstructorInfo IndexConstructor =
         typeof(Index).GetConstructor([typeof(int), typeof(bool)])!;
 
@@ -191,6 +193,32 @@ internal sealed partial class Binder
 
         return null;
     }
+
+#else
+
+    // ============================================================ ^e and a..b
+
+    // This target has neither Index/Range in the framework nor RuntimeHelpers.GetSubArray, and
+    // the shims this assembly carries for its own use are internal — emitting them into a script
+    // would hand the host a type it cannot name. The subscript forms are reported instead.
+
+    private const string IndexRangeUnsupported =
+        "当前目标框架（netstandard2.0）不支持 '^' 与 '..'；" +
+        "请改用显式下标，或使用 net6.0 及以上的 V.Script。";
+
+    private BoundExpression BindFromEnd(FromEndExpressionSyntax syntax) =>
+        Fail(syntax.Position, ErrorCode.ConstructNotSupported, IndexRangeUnsupported);
+
+    private BoundExpression BindRange(RangeExpressionSyntax syntax) =>
+        Fail(syntax.Position, ErrorCode.ConstructNotSupported, IndexRangeUnsupported);
+
+    /// <summary>Always null here: nothing can produce an <c>Index</c> or <c>Range</c> to begin with.</summary>
+    private BoundExpression? TryBindIndexOrRangeAccess(
+        BoundExpression receiver,
+        IReadOnlyList<BoundExpression> arguments,
+        SourcePosition position) => null;
+
+#endif
 
     // ============================================================ with
 

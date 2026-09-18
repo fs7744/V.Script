@@ -57,6 +57,7 @@ public enum ErrorCode
     BreakOutsideLoop = 3002,
     ContinueOutsideLoop = 3003,
     AwaitInExceptionHandler = 3004,
+    AsyncNotAvailable = 3008,
     NotAllCodePathsReturn = 3005,
     SwitchSectionFallsThrough = 3006,
     UseOfUnassignedVariable = 3007,

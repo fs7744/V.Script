@@ -81,21 +81,25 @@ internal static class MemberCache
         public MethodInfo[] MethodsNamed(BindingFlags flags, string name) =>
             _named.GetOrAdd((flags, name), static (key, self) =>
             {
-                var all = self.Methods(key.Flags);
+                // Positional deconstruction, because tuple element names do not survive the
+                // generic signature of GetOrAdd on every target.
+                var (keyFlags, keyName) = key;
+
+                var all = self.Methods(keyFlags);
                 var matches = new List<MethodInfo>();
 
                 foreach (var method in all)
-                    if (string.Equals(method.Name, key.Name, StringComparison.Ordinal))
+                    if (string.Equals(method.Name, keyName, StringComparison.Ordinal))
                         matches.Add(method);
 
                 return matches.Count == 0 ? [] : [.. matches];
             }, this);
 
         public PropertyInfo? Property(BindingFlags flags, string name) =>
-            _property.GetOrAdd((flags, name), static (key, t) => t.GetProperty(key.Name, key.Flags), type);
+            _property.GetOrAdd((flags, name), static (key, t) => t.GetProperty(key.Item2, key.Item1), type);
 
         public FieldInfo? Field(BindingFlags flags, string name) =>
-            _field.GetOrAdd((flags, name), static (key, t) => t.GetField(key.Name, key.Flags), type);
+            _field.GetOrAdd((flags, name), static (key, t) => t.GetField(key.Item2, key.Item1), type);
 
         public PropertyInfo[] Properties(BindingFlags flags) =>
             _properties.GetOrAdd(flags, static (f, t) => t.GetProperties(f), type);

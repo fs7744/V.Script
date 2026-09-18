@@ -18,6 +18,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\V.Script\V.Script.csproj" />
+    <ProjectReference Include="..\..\src\V.Script.Async\V.Script.Async.csproj" />
   </ItemGroup>
 
 </Project>

@@ -1,8 +1,10 @@
 using V.Script.Diagnostics;
 
-namespace V.Script.Tests;
+using V.Script.Tests;
 
-public sealed class AsyncExecutionTests : ScriptTest
+namespace V.Script.Async.Tests;
+
+public sealed class AsyncExecutionTests : AsyncScriptTest
 {
     [Fact]
     public async Task Awaiting_a_completed_task()
@@ -151,7 +153,7 @@ public sealed class AsyncExecutionTests : ScriptTest
     }
 }
 
-public sealed class AsyncRestrictionTests : ScriptTest
+public sealed class AsyncRestrictionTests : AsyncScriptTest
 {
     [Fact]
     public void Await_in_a_synchronous_script_is_rejected()

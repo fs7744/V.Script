@@ -321,7 +321,6 @@ internal sealed class DefiniteAssignment(DiagnosticBag diagnostics)
 
             case BoundIsType isType: yield return isType.Operand; break;
             case BoundAsType asType: yield return asType.Operand; break;
-            case BoundAwait await: yield return await.Operand; break;
             case BoundThrowExpression thrown: yield return thrown.Exception; break;
 
             case BoundConditionalAccess access:

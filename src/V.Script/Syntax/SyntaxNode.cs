@@ -42,7 +42,7 @@ public sealed record TypeSyntax(
                 return '(' + string.Join(", ", elements) + ')';
             }
 
-            var name = string.Join('.', NameParts);
+            var name = string.Join(".", NameParts);
             if (TypeArguments.Count > 0)
                 name += '<' + string.Join(", ", TypeArguments.Select(a => a.DisplayName)) + '>';
             if (IsNullable) name += '?';

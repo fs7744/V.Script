@@ -24,7 +24,7 @@ internal static class Preprocessor
         for (var i = 0; i < lines.Length; i++)
         {
             var trimmed = lines[i].TrimStart();
-            if (!trimmed.StartsWith('#'))
+            if (trimmed.Length == 0 || trimmed[0] != '#')
             {
                 if (states.Count > 0 && !states.Peek().Taking)
                 {
@@ -85,7 +85,7 @@ internal static class Preprocessor
                 "缺少 #endif。");
         }
 
-        return changed ? string.Join('\n', lines) : source;
+        return changed ? string.Join("\n", lines) : source;
     }
 
     private static bool Pop(
@@ -106,7 +106,8 @@ internal static class Preprocessor
     }
 
     /// <summary>A carriage return has to survive, or CRLF sources gain a stray character.</summary>
-    private static string Blank(string line) => line.EndsWith('\r') ? "\r" : string.Empty;
+    private static string Blank(string line) =>
+        line.Length > 0 && line[line.Length - 1] == '\r' ? "\r" : string.Empty;
 
     private static (string Directive, string Argument) Split(string text)
     {

@@ -104,10 +104,34 @@ Lexer  →  Parser  →  Binder  →  BoundTree  →  IlEmitter
 `DynamicMethod` 与 `MethodBuilder` 都提供 `ILGenerator`，同一套发射代码打两个靶子。Binder
 绑定完成时已知脚本是否含 `await`，据此选载体。
 
-| | 载体 | 编译耗时 | 单独卸载 |
-|---|---|---:|---|
-| 同步脚本 | `DynamicMethod` | 7.5 µs | 随委托自动回收 |
-| 异步脚本 | 独占 collectible 程序集 | 556 µs | `Dispose()` |
+| | 载体 | 编译耗时 | 单独卸载 | 所在库 |
+|---|---|---:|---|---|
+| 同步脚本 | `DynamicMethod` | 7.5 µs | 随委托自动回收 | `V.Script` |
+| 异步脚本 | collectible 程序集里的真实方法 | 556 µs | `Dispose()` | `V.Script.Async` |
+
+### 两个库，一条缝
+
+这张表就是拆库的理由。可挂起的方法必须带 `MethodImplAttributes.Async`（0x2000）告诉 JIT 去建
+状态机，而 `DynamicMethod` 没有 `SetImplementationFlags`，永远带不上——所以异步脚本必须进真实
+程序集，也只有异步脚本需要 .NET 11 的 runtime-async。
+
+| | `V.Script` | `V.Script.Async` |
+|---|---|---|
+| TFM | **netstandard2.0, net6.0 – net10.0** | net11.0 |
+| 依赖实验性 `AsyncHelpers`（`SYSLIB5007`） | 否 | 是 |
+| 载体 | `DynamicMethod` | collectible 程序集 |
+| 入口 | `Compile` / `CompileDelegate` | `CompileAsync` / `CompileAsyncDelegate`（扩展方法） |
+
+缝开在 `IAsyncSupport` 上——绑定器问它三件事：某个类型能不能 await、async 体的声明返回类型剥掉
+`Task` 之后是什么、以及到哪里去放带 Async 标志的方法。没装扩展时它是 null，`await` 与 `async`
+lambda 都在绑定期报错，而不是走到发射器再以更难懂的方式失败。
+
+**基础库仍然解析 `await` 和 `async`**：它们是语言的一部分，把它们变成语法错误只会给出更差的
+提示。基础库缺的是编译它们的能力，不是识别它们的能力。
+
+发射器对异步的认知是**零**。`await x` 降级成一次普通静态调用——`AsyncHelpers.Await(x)` 接收
+awaitable、返回结果，状态机由 JIT 在这个调用周围建起来——所以曾经的 `BoundAwait` 节点和
+`EmitAwait` 都不存在了。唯一残留的是定义 lambda 方法时打不打 0x2000，那本来就是载体的事。
 
 **lambda 永远是 `DynamicMethod`**，无论所属脚本用哪种载体——lambda 体内不允许挂起点，所以
 不需要 Async 标志。
@@ -144,7 +168,7 @@ static TResult __lambda0(ScriptClosure closure, T0 p0);
 同步脚本随委托被 GC 回收，无需管理。异步脚本默认每个独占一个 `RunAndCollect` 程序集，委托、
 `Type`、`AssemblyBuilder` 全部失去引用后运行时异步卸载。
 
-`ScriptOptions.ScriptsPerGeneratedAssembly` 可以让若干个脚本共用一个程序集。程序集的创建几乎
+`ScriptOptions.WithAsync(scriptsPerGeneratedAssembly)` 可以让若干个脚本共用一个程序集。程序集的创建几乎
 就是异步编译的全部开销，而它按程序集计费不按脚本计费，所以摊薄的效果很直接（§12）。换来的代价
 是卸载粒度：一代装满即退休，此后只有代里最后一个脚本被释放时才整代卸载，一个长寿脚本会把同代
 其余脚本的代码一起钉住。默认值 1 保持上面这段语义逐字不变——按批编译、按批淘汰的宿主才该调大它。
@@ -402,17 +426,31 @@ decimal v = script.Run(ctx);
 Globals 的公开实例成员可作为裸标识符访问，编译期解析为成员访问，**不是字典查找**；局部变量是
 真正的 IL 局部。脚本最后一条语句若是裸表达式即为返回值，无需 `return` 也无需结尾分号。
 
-四个编译入口：
+四个编译入口，分在两个库里：
 
 ```csharp
+// V.Script
 Script<TG, TR>       Compile<TG, TR>(source)               // 同步，遇 await 报 VS3001
-AsyncScript<TG, TR>  CompileAsync<TG, TR>(source)          // 异步
 TDelegate            CompileDelegate<TD>(source, names)    // 同步，直接返回委托
+
+// V.Script.Async —— ScriptEngine 上的扩展方法，命名空间同为 V.Script
+AsyncScript<TG, TR>  CompileAsync<TG, TR>(source)          // 异步
 ScriptDelegate<TD>   CompileAsyncDelegate<TD>(src, names)  // 异步，可释放
 ```
 
+两个异步入口是扩展方法，但命名空间仍是 `V.Script`，所以加上包引用之后既有调用代码一行都不用改。
+
 `CompileAsyncDelegate` 返回可释放的包装，因为生成程序集按脚本持有；`CompileDelegate` 直接返回
 委托，`DynamicMethod` 无需显式释放。
+
+`CompileAsync` 不需要额外开关——异步编译本来就是扩展库自己的活，它自带所需的支持。需要显式
+`WithAsync()` 的只有一种情况：**同步脚本里写 `async` lambda**。那时决定能不能编译的是基础库的
+绑定器，它必须在绑定期就知道答案：
+
+```csharp
+var engine = new ScriptEngine(ScriptOptions.Default.WithAsync());
+using var s = engine.Compile<Ctx, int>("Func<Task<int>> f = async () => await F(); return f().Result;");
+```
 
 ### 诊断一次报全
 
@@ -446,19 +484,19 @@ dotnet run --project tools/V.Script.Probe -c Release
 | 类别 | 内容 |
 |---|---|
 | 字面量 | 全部数值形式、字符、字符串、逐字 `@"..."`、原始 `"""..."""`、插值（含 `$@""`、`$$"""..."""`、对齐与格式说明符） |
-| 表达式 | 完整算术/关系/逻辑/位运算含数值提升与可空提升、`?.` `??` `??=` `is` `as` `typeof`、`nameof`、`default` / `default(T)`、throw 表达式、`checked` / `unchecked`、**`^i` 与 `a..b`**、**`with`**、强制转换、条件表达式 |
+| 表达式 | 完整算术/关系/逻辑/位运算含数值提升与可空提升、`?.` `??` `??=` `is` `as` `typeof`、`nameof`、`default` / `default(T)`、throw 表达式、`checked` / `unchecked`、**`^i` 与 `a..b`**（netstandard2.0 除外）、**`with`**、强制转换、条件表达式 |
 | 名称与成员 | 局部变量、globals 成员、完全限定名、嵌套类型、静态成员、索引器、扩展方法 |
 | 类型 | 泛型、可空值类型 `int?`、可空引用注解 `string?`（接受后忽略）、**`nint` / `nuint`**、数组、多维数组、元组 |
 | 调用 | 重载决议（`params`、可选与命名参数）、泛型推断（含公共类型）、显式类型实参、**`ref` / `out` 实参**（含 `out var x`）、**方法组转委托** |
 | 构造 | 对象创建、委托创建 `new Func<...>(f)`、对象/集合/**索引**/**嵌套**初始化器、数组三种写法、**多维数组**、集合表达式（含 **`..` 展开**） |
-| 函数 | lambda（表达式体与块体，形参可写类型，可推断自然委托类型）、**`async` lambda**、闭包、局部函数（含递归、互递归、**`static`**、**`async`**） |
+| 函数 | lambda（表达式体与块体，形参可写类型，可推断自然委托类型）、`async` lambda（需 `V.Script.Async`）、闭包、局部函数（含递归、互递归、`static`、`async`） |
 | 元组 | 字面量、类型、元素名、**任意元数**（超过 7 元自动嵌套 `Rest`）、解构（`var (a, b)`、`(a, b) =`、混合、`Deconstruct` 方法） |
 | 语句 | `if`/`while`/`do`/`for`/`foreach`/`break`/`continue`/`return`、`switch`、`try`/`catch`/`finally`/`throw`、`using`（含 `using var`）、`lock`、标签与 `goto`（含 `goto case` / `goto default`）、**局部 `const`** |
 | 模式 | 常量、类型、关系、`and`/`or`/`not`、属性、`var`、丢弃、**位置**、**列表**（含 `..` 切片），以及 `switch` 表达式 |
 | 分析 | 必定返回检查、`switch` 落空检查、**明确赋值分析** |
 | 查询 | **LINQ 查询语法**：`from` / `where` / `select` / `orderby` / `let` / 多重 `from` / `join`（含 `into`）/ `group by` / `into` |
 | 预处理 | **`#if` / `#elif` / `#else` / `#endif`**，符号由 `ScriptOptions.AddPreprocessorSymbols` 提供 |
-| 异步 | `await`，真正的 runtime-async 状态机 |
+| 异步 | `await`，真正的 runtime-async 状态机（需 `V.Script.Async`） |
 
 ### 与 C# 的行为差异
 
@@ -487,6 +525,8 @@ dotnet run --project tools/V.Script.Probe -c Release
 - **明确赋值分析在看不清的地方偏向放行**：被捕获的变量不参与判断（赋值可能发生在另一个函数里），
   而函数里一旦出现标签，其后不再跟踪——`goto` 可以从任何地方跳来。宁可漏报也不误报
 - **`goto` 不能跳进 `try`/`catch`/`finally`**，与 IL 的规则一致，编译期就会报错
+- **`async` lambda 需要 `V.Script.Async`，且要 `ScriptOptions.WithAsync()`**：基础库能解析它，
+  但编译不了——它必须带 Async 标志，而同步载体给不出带得上这个标志的方法。
 - **`async` lambda 所在的脚本会多一个程序集**：`async` 需要 `MethodImplAttributes.Async`，
   而 `DynamicMethod` 表达不了它（§3）。同步脚本里出现 `async` lambda 时，脚本体仍是
   `DynamicMethod`，只有这些 lambda 被放进一个可回收程序集。副作用是这些 lambda 失去了
@@ -566,20 +606,35 @@ dotnet run --project bench/V.Script.Benchmarks -c Release -- --filter "*"
 
 | 场景 | 手写 C# | 脚本 | 脚本/C# | 分配 |
 |---|---:|---:|---:|---:|
-| 对象初始化器 | 6.10 ns | 6.12 ns | 1.00 | 32 B（两侧相同） |
-| 集合初始化器 ×4 | 14.80 ns | 15.24 ns | 1.03 | 72 B（两侧相同） |
-| `new[] { a, b, c }` | 5.40 ns | 6.28 ns | 1.16 | 40 B（两侧相同） |
-| `$"{Name}#{Id}"` | 34.36 ns | 24.27 ns | 0.71 | 72 B / 80 B |
-| `$"{Name,-10}#{Amount:F2}"` | 166.44 ns | 169.16 ns | 1.02 | 88 B（两侧相同） |
-| `[a, b, c]` → `int[]` | 6.73 ns | 6.06 ns | 0.90 | 40 B（两侧相同） |
-| `[1, 2, 3, 4]` → `List<int>` | 12.97 ns | 13.45 ns | 1.04 | 72 B（两侧相同） |
+| 对象初始化器 | 5.02 ns | 6.03 ns | 1.20 | 32 B（两侧相同） |
+| 集合初始化器 ×4 | 12.74 ns | 14.42 ns | 1.13 | 72 B（两侧相同） |
+| `new[] { a, b, c }` | 4.82 ns | 6.13 ns | 1.27 | 40 B（两侧相同） |
+| `$"{Name}#{Id}"` | 31.60 ns | 21.29 ns | 0.67 | 72 B / 80 B |
+| `$"{Name,-10}#{Amount:F2}"` | 159.07 ns | 159.89 ns | 1.01 | 88 B（两侧相同） |
+| `[a, b, c]` → `int[]` | 5.07 ns | 5.63 ns | 1.11 | 40 B（两侧相同） |
+| `[1, 2, 3, 4]` → `List<int>` | 8.54 ns | 12.26 ns | 1.44 | 72 B（两侧相同） |
 
-这张表列了比值：**同一次运行里的两行才可比**，跨运行的绝对纳秒数在这台机器上会整体漂移 20–30%。
+这张表列了比值：**同一次运行里的两行才可比**，跨运行的绝对纳秒数在这台机器上会整体漂移 20–30%，
+连手写 C# 那一侧也一样。拿不同运行里的 C# 基线去算比值会得出完全错误的结论。
 
 构造型写法都只比手写多一次委托调用，分配量逐字节相同——它们降级成的 IL 与 C# 编译器产出的
-是同一份。集合表达式转 `List<T>` 曾经慢 44%，因为引擎用无参构造再逐个 `Add`，backing array
-要扩容一次；改用容量构造函数后是 1.04。只对 `List<T>` 这样特判：`(int)` 构造函数在它身上确定
-是容量，换个集合可能是别的意思，猜错就是静默的错误。
+是同一份。
+
+集合表达式转 `List<T>` 是差距最大的一项，值得说清楚它由什么构成。引擎用容量构造函数加逐个
+`Add`，C# 编译器用 `CollectionsMarshal.SetCount` 加一次 span 拷贝。容量构造函数本身是有效的
+（A/B 同一次机器状态下测得）：
+
+| | 手写 C# | 脚本 | 比值 |
+|---|---:|---:|---:|
+| 无参构造 + `Add` | 8.94 ns | 14.88 ns | 1.67 |
+| 容量构造 + `Add` | 8.54 ns | **12.26 ns** | **1.44** |
+
+省下的**不是内存**——两种写法都是 72 B，4 个元素在 `List<T>` 里本来就只分配一次数组。省下的是
+首次 `Add` 走 `AddWithResize` 慢路径的那次分支与非内联调用，约 2.6 ns。剩下的 1.44 是四次 `Add`
+对一次 span 拷贝，要抹平得让绑定器认识 `CollectionsMarshal`，暂时不值得。
+
+只对 `List<T>` 这样特判：`(int)` 构造函数在它身上确定是容量，换个集合可能是别的意思，猜错就是
+静默的错误。
 
 两行插值字符串的降级方式不同，值得单独看：
 
@@ -633,12 +688,12 @@ dotnet run --project bench/V.Script.Benchmarks -c Release -- --filter "*"
 
 | 场景 | 耗时 | 分配 |
 |---|---:|---:|
-| 同步，小脚本 | 9.3 µs | 10.0 KB |
-| 同步，中等（5 条语句） | 27.6 µs | 32.9 KB |
-| 异步，小脚本 | 602 µs | 8.7 KB |
-| 异步，含 await 的循环 | 719 µs | 22.8 KB |
-| 异步，小脚本，16 个共用一个程序集 | **116 µs** | 7.7 KB |
-| 缓存命中 | 54.4 ns | 96 B |
+| 同步，小脚本 | 8.0 µs ±0.15 | 10.05 KB |
+| 同步，中等（5 条语句） | 24.5 µs ±0.33 | 32.88 KB |
+| 异步，小脚本 | 345 µs ±6.9 | 9.35 KB |
+| 异步，含 await 的循环 | 625 µs ±25 | 22.92 KB |
+| 异步，小脚本，16 个共用一个程序集 | **107 µs** ±2.1 | 7.74 KB |
+| 缓存命中 | 53.2 ns ±0.6 | 96 B |
 
 绑定期的反射查找全部走 `Binding/MemberCache.cs`。`Type.GetMethods` 与 `MethodBase.GetParameters`
 每次调用都新建一个数组——`MethodInfo` 本身运行时已经缓存了，数组没有——所以绑定 `Price * Quantity`
@@ -657,14 +712,24 @@ dotnet run --project bench/V.Script.Benchmarks -c Release -- --filter "*"
 明确赋值分析占中等脚本的 6.8%（关掉它是 25.7 µs）。它按语句遍历绑定后的树，用的是持久化集合而
 不是每次赋值拷贝一份——先用 `HashSet` 写时代价是 34%，换成 `ImmutableHashSet` 后降到个位数百分比。
 
-异步比同步贵一到两个数量级，全部来自 collectible 程序集的创建与卸载。具体倍数取决于任务长度：
-短任务测得约 40 倍，默认任务下是 64 倍——迭代越多，同时存活的待卸载程序集越多，卸载越贵。这就是
-`DynamicMethod` 无法标记 `Async` 这一个 API 缺口的全部代价。
+异步比同步贵一到两个数量级，全部来自 collectible 程序集的创建与卸载。这就是 `DynamicMethod`
+无法标记 `Async` 这一个 API 缺口的全部代价。
 
-倒数第二行是 `ScriptsPerGeneratedAssembly = 16` 的同一个脚本：**602 µs 降到 116 µs，5.2 倍**，
-Gen2 回收从每千次 2.93 降到 0.12。省不到 16 倍，是因为按类型计费的那部分（`DefineType`、
-`CreateType`）摊不掉。这一行的脚本按批保留、批满再一起释放——立刻释放的话每代都会在下次迭代
-复用它之前就走完一生，就测不到分代的意义了。卸载粒度的代价见 §4。
+**异步那三行在不同运行之间会大幅摆动**，同步两行不会。原因是它们量的不只是编译，还有卸载与
+GC 的时机：同时存活的待卸载程序集越多，每次越贵，而这取决于任务长度和上一次迭代留下的状态。
+所以这三行只能同一次运行内部横向比，不能跨运行比绝对值——分配量倒是稳定的。
+
+倒数第二行是 `WithAsync(16)` 的同一个脚本。同一次运行内的对比：
+
+| 运行 | 一脚本一程序集 | 16 个共用 | 倍数 |
+|---|---:|---:|---:|
+| 本表 | 345 µs | 107 µs | 3.2 |
+| 另一次默认任务 | 602 µs | 116 µs | 5.2 |
+| 短任务 | 602 µs | 56 µs | 10.7 |
+
+**摊薄是确定有效的，倍数是 3 到 10**，具体落在哪取决于卸载压力。省不到 16 倍，是因为按类型
+计费的那部分（`DefineType`、`CreateType`）摊不掉。这一行的脚本按批保留、批满再一起释放——
+立刻释放的话每代都会在下次迭代复用它之前就走完一生，就测不到分代的意义了。卸载粒度的代价见 §4。
 
 ---
 
@@ -673,10 +738,10 @@ Gen2 回收从每千次 2.93 降到 0.12。省不到 16 倍，是因为按类型
 | 项 | 影响 | 应对 |
 |---|---|---|
 | **.NET 11 尚未 GA** | 目前基于 preview 7；GA 预计 2026 年 11 月 | GA 后重跑 `tools/V.Script.RuntimeAsyncCheck`。`global.json` 精确 pin 了预览版号（`rollForward` 无法从正式版号回退到预览版），GA 后需改 |
-| **`AsyncHelpers` 标记 `SYSLIB5007`** | 实验性 API，签名可能变更 | 使用点集中在 `Binding/AwaitHelpers.cs` 单个文件 |
+| **`AsyncHelpers` 标记 `SYSLIB5007`** | 实验性 API，签名可能变更 | 使用点集中在 `V.Script.Async/AsyncSupport.cs` 单个文件；基础库完全不碰 |
 | **无执行限制** | 死循环脚本会占住线程直到进程结束 | 不可信脚本需宿主侧校验，或跑在可放弃的线程上 |
 | **无调试器支持** | 脚本无法单步调试 | 行号映射 + 结构化诊断；必要时提供脚本级 trace |
-| **异步脚本 31 KB 固定开销** | 一万个异步脚本约 310 MB | `ScriptsPerGeneratedAssembly` 让多个脚本共用一个程序集，代价是卸载粒度变成整代（§4）；同步脚本无此开销 |
+| **异步脚本 31 KB 固定开销** | 一万个异步脚本约 310 MB | `WithAsync(n)` 让多个脚本共用一个程序集，代价是卸载粒度变成整代（§4）；同步脚本无此开销，不引用 `V.Script.Async` 则完全没有 |
 | **捕获超过 4 个变量时装箱** | 第 5 个槽起退回 `ArrayClosure`，值类型捕获重新有装箱开销 | 再加几档强类型布局即可，代价是每一档多一份泛型实例化 |
 | **闭包槽的地址没有被用起来** | 被捕获的变量仍不能作 `ref`/`out` 实参，也仍不参与明确赋值分析 | 强类型槽已经是字段、`ldflda` 拿得到地址，但绑定器两处还按老规矩挡着（`Binder.RefArguments` 与 `DefiniteAssignment`），要放开得连同 `ArrayClosure` 那条退路一起想清楚 |
 

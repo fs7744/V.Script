@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>V.Script.Async</RootNamespace>
+    <AssemblyName>V.Script.Async</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="V.Script.Async.Tests" />
+    <InternalsVisibleTo Include="V.Script.Benchmarks" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\V.Script\V.Script.csproj" />
+  </ItemGroup>
+</Project>

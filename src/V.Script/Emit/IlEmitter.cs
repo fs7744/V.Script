@@ -48,9 +48,9 @@ internal sealed partial class IlEmitter
 
     /// <summary>
     /// Emits the script body into <paramref name="il"/> and every lambda into a method of its
-    /// own. A synchronous lambda goes into a <see cref="DynamicMethod"/>; an async one needs
-    /// <see cref="MethodImplAttributes.Async"/>, which only a real method can carry, so it goes
-    /// into <paramref name="asyncHost"/> — the same reason the script body has two carriers.
+    /// own. A synchronous lambda goes into a <see cref="DynamicMethod"/>; an async one needs the
+    /// Async implementation flag, which only a real method can carry, so it goes into
+    /// <paramref name="asyncHost"/> — the same reason the script body has two carriers.
     /// </summary>
     /// <returns>
     /// The step that publishes the lambda table. It runs after the host type is created, because
@@ -149,8 +149,12 @@ internal sealed partial class IlEmitter
             lambda.DeclaredReturnType!,
             parameterTypes);
 
+        // 0x2000 is MethodImplAttributes.Async, which tells the JIT to build the state machine.
+        // Spelled numerically because the named member only exists from .NET 11, and this library
+        // targets a released framework — the value itself is what the runtime reads, and only
+        // V.Script.Async ever gets an async lambda this far.
         builder.SetImplementationFlags(
-            MethodImplAttributes.IL | MethodImplAttributes.Managed | MethodImplAttributes.Async);
+            MethodImplAttributes.IL | MethodImplAttributes.Managed | (MethodImplAttributes)0x2000);
 
         return new LambdaMethod(null, builder);
     }

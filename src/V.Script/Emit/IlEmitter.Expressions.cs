@@ -35,7 +35,6 @@ internal sealed partial class IlEmitter
             case BoundArrayCreation creation: EmitArrayCreation(creation); break;
             case BoundNewArray creation: EmitNewArray(creation); break;
             case BoundThrowExpression thrown: EmitThrowExpression(thrown); break;
-            case BoundAwait await: EmitAwait(await); break;
             case BoundIsType isType: EmitIsType(isType); break;
             case BoundAsType asType: EmitAsType(asType); break;
             case BoundTypeofExpression typeofExpression: EmitTypeof(typeofExpression); break;
@@ -1038,17 +1037,7 @@ internal sealed partial class IlEmitter
         }
     }
 
-    // ============================================================ async & type tests
-
-    /// <summary>
-    /// A suspension point. The JIT turns this call into the state machine, so the whole of
-    /// <c>await</c> support on the emit side is one operand plus one call.
-    /// </summary>
-    private void EmitAwait(BoundAwait await)
-    {
-        EmitExpression(await.Operand);
-        _il.Emit(OpCodes.Call, await.AwaitHelper);
-    }
+    // ============================================================ type tests
 
     private void EmitIsType(BoundIsType isType)
     {

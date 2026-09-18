@@ -141,14 +141,6 @@ public enum BoundUnaryKind
     Plus, Negate, LogicalNot, BitwiseNot,
 }
 
-public enum AwaitKind
-{
-    Task,
-    TaskOfT,
-    ValueTask,
-    ValueTaskOfT,
-}
-
 // ================================================================= expressions
 
 public abstract record BoundExpression(SourcePosition Position, Type Type);
@@ -324,13 +316,6 @@ public sealed record BoundArrayCreation(
     SourcePosition Position,
     Type ElementType,
     IReadOnlyList<BoundExpression> Elements) : BoundExpression(Position, ElementType.MakeArrayType());
-
-public sealed record BoundAwait(
-    SourcePosition Position,
-    Type Type,
-    BoundExpression Operand,
-    AwaitKind Kind,
-    MethodInfo AwaitHelper) : BoundExpression(Position, Type);
 
 public sealed record BoundIsType(
     SourcePosition Position,

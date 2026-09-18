@@ -40,7 +40,7 @@ public class CompilationBenchmarks
     public void Setup()
     {
         _engine = new ScriptEngine(ScriptOptions.Default);
-        _batched = new ScriptEngine(ScriptOptions.Default with { ScriptsPerGeneratedAssembly = BatchSize });
+        _batched = new ScriptEngine(ScriptOptions.Default.WithAsync(BatchSize));
 
         // Warm the reflection caches so the first measured iteration is not an outlier.
         _engine.Compile<PricingContext, decimal>(Unique(SmallSource)).Dispose();

@@ -363,15 +363,5 @@ public sealed class DeconstructionTests : ScriptTest
     public void A_repeated_name_is_reported() =>
         AssertErrorIn("var (a, a) = (1, 2); return 0;", ErrorCode.VariableAlreadyDefined);
 
-    [Fact]
-    public async Task Deconstruction_works_in_an_async_script()
-    {
-        const string source = """
-            var value = await Service.CompletedAsync(3);
-            var (a, b) = (value, value * 2);
-            return a + b;
-            """;
 
-        Assert.Equal(12, await RunAsync<AsyncGlobals, int>(source, new AsyncGlobals()));
-    }
 }

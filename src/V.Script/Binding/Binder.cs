@@ -71,18 +71,26 @@ internal sealed partial class Binder
     private int _tempCounter;
     private bool _sawReturn;
 
+    /// <summary>
+    /// How to compile <c>await</c> and <c>async</c> lambdas, or null when the async extension is
+    /// not installed — in which case both are reported as errors rather than silently ignored.
+    /// </summary>
+    private readonly IAsyncSupport? _async;
+
     public Binder(
         DiagnosticBag diagnostics,
         TypeResolver resolver,
         IReadOnlyList<ScriptParameter> parameters,
         Type returnType,
-        bool isAsync)
+        bool isAsync,
+        IAsyncSupport? asyncSupport = null)
     {
         _diagnostics = diagnostics;
         _resolver = resolver;
         _parameters = parameters;
         _globals = parameters.FirstOrDefault(p => p.IsGlobals);
         _returnType = returnType;
+        _async = asyncSupport;
         _isAsync = isAsync;
         _isAsyncContext = isAsync;
         _scope = new Scope(null);
@@ -788,7 +796,8 @@ internal sealed partial class Binder
 
     private static MethodInfo? FindGetEnumerator(Type type)
     {
-        var duck = type.GetMethod("GetEnumerator", BindingFlags.Public | BindingFlags.Instance, Type.EmptyTypes);
+        var duck = type.GetMethod("GetEnumerator",
+            BindingFlags.Public | BindingFlags.Instance, binder: null, Type.EmptyTypes, modifiers: null);
         if (duck is not null && duck.ReturnType != typeof(void)) return duck;
 
         foreach (var iface in type.GetInterfaces())
@@ -815,7 +824,7 @@ internal sealed partial class Binder
     private static MethodInfo? FindMoveNext(Type enumeratorType)
     {
         var direct = enumeratorType.GetMethod("MoveNext",
-            BindingFlags.Public | BindingFlags.Instance, Type.EmptyTypes);
+            BindingFlags.Public | BindingFlags.Instance, binder: null, Type.EmptyTypes, modifiers: null);
         if (direct is not null && direct.ReturnType == typeof(bool)) return direct;
 
         return typeof(System.Collections.IEnumerator).GetMethod("MoveNext");

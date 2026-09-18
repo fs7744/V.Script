@@ -15,6 +15,18 @@ public static class ScriptOperations
     /// <typeparamref name="T"/> so that it can sit in the value position of the conditional
     /// chain the binder lowers a switch expression into.
     /// </summary>
+    /// <remarks>
+    /// netstandard2.0 has no <c>SwitchExpressionException</c>. Declaring one here would put a
+    /// second type of that name into the world, so that build throws
+    /// <see cref="InvalidOperationException"/> instead — the only behavioural difference between
+    /// the assets, and it is documented in the README.
+    /// </remarks>
     [MethodImpl(MethodImplOptions.NoInlining)]
-    public static T NoMatchingSwitchArm<T>(object? value) => throw new SwitchExpressionException(value);
+    public static T NoMatchingSwitchArm<T>(object? value) =>
+#if NETSTANDARD2_0
+        throw new InvalidOperationException(
+            $"switch 表达式没有匹配的分支，输入为 {value ?? "null"}。");
+#else
+        throw new SwitchExpressionException(value);
+#endif
 }
