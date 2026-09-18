@@ -94,7 +94,10 @@ public sealed class Lexer
 
     public List<Token> Tokenize()
     {
-        var tokens = new List<Token>();
+        // Measured at roughly one token per three characters. The floor is 4 because that is what
+        // List<T> allocates on its first Add anyway — a larger one made one-line scripts, which
+        // are the common shape, allocate more than they did with no estimate at all.
+        var tokens = new List<Token>(Math.Max(4, _text.Length / 3));
         while (true)
         {
             var token = Next();
